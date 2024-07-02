@@ -238,7 +238,10 @@ impl PartitionEvaluator for WindowShiftEvaluator {
             let start = if self.non_null_offsets.len() == self.shift_offset as usize {
                 // How many rows needed previous than the current row to get necessary lag result
                 let offset: usize = self.non_null_offsets.iter().sum();
-                idx.saturating_sub(offset + 1)
+                idx.saturating_sub(offset)
+            } else if !self.ignore_nulls {
+                let offset = self.shift_offset as usize;
+                idx.saturating_sub(offset)
             } else {
                 0
             };
@@ -249,6 +252,9 @@ impl PartitionEvaluator for WindowShiftEvaluator {
                 // How many rows needed further than the current row to get necessary lead result
                 let offset: usize = self.non_null_offsets.iter().sum();
                 min(idx + offset + 1, n_rows)
+            } else if !self.ignore_nulls {
+                let offset = (-self.shift_offset) as usize;
+                min(idx + offset, n_rows)
             } else {
                 n_rows
             };
@@ -397,10 +403,8 @@ impl PartitionEvaluator for WindowShiftEvaluator {
 mod tests {
     use super::*;
     use crate::expressions::Column;
-    use arrow::record_batch::RecordBatch;
     use arrow::{array::*, datatypes::*};
     use datafusion_common::cast::as_int32_array;
-    use datafusion_common::Result;
 
     fn test_i32_result(expr: WindowShift, expected: Int32Array) -> Result<()> {
         let arr: ArrayRef = Arc::new(Int32Array::from(vec![1, -2, 3, -4, 5, -6, 7, 8]));
@@ -413,6 +417,51 @@ mod tests {
             .evaluate_all(&values, batch.num_rows())?;
         let result = as_int32_array(&result)?;
         assert_eq!(expected, *result);
+        Ok(())
+    }
+
+    #[test]
+    fn lead_lag_get_range() -> Result<()> {
+        // LAG(2)
+        let lag_fn = WindowShiftEvaluator {
+            shift_offset: 2,
+            default_value: ScalarValue::Null,
+            ignore_nulls: false,
+            non_null_offsets: Default::default(),
+        };
+        assert_eq!(lag_fn.get_range(6, 10)?, Range { start: 4, end: 7 });
+        assert_eq!(lag_fn.get_range(0, 10)?, Range { start: 0, end: 1 });
+
+        // LAG(2 ignore nulls)
+        let lag_fn = WindowShiftEvaluator {
+            shift_offset: 2,
+            default_value: ScalarValue::Null,
+            ignore_nulls: true,
+            // models data received [<Some>, <Some>, <Some>, NULL, <Some>, NULL, <current row>, ...]
+            non_null_offsets: vec![2, 2].into(), // [1, 1, 2, 2] actually, just last 2 is used
+        };
+        assert_eq!(lag_fn.get_range(6, 10)?, Range { start: 2, end: 7 });
+
+        // LEAD(2)
+        let lead_fn = WindowShiftEvaluator {
+            shift_offset: -2,
+            default_value: ScalarValue::Null,
+            ignore_nulls: false,
+            non_null_offsets: Default::default(),
+        };
+        assert_eq!(lead_fn.get_range(6, 10)?, Range { start: 6, end: 8 });
+        assert_eq!(lead_fn.get_range(9, 10)?, Range { start: 9, end: 10 });
+
+        // LEAD(2 ignore nulls)
+        let lead_fn = WindowShiftEvaluator {
+            shift_offset: -2,
+            default_value: ScalarValue::Null,
+            ignore_nulls: true,
+            // models data received [..., <current row>, NULL, <Some>, NULL, <Some>, ..]
+            non_null_offsets: vec![2, 2].into(),
+        };
+        assert_eq!(lead_fn.get_range(4, 10)?, Range { start: 4, end: 9 });
+
         Ok(())
     }
 

@@ -18,34 +18,35 @@
 //! Expression utilities
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::expr::{Alias, Sort, WindowFunction};
 use crate::expr_rewriter::strip_outer_reference;
-use crate::logical_plan::Aggregate;
 use crate::signature::{Signature, TypeSignature};
 use crate::{
-    and, BinaryExpr, Cast, Expr, ExprSchemable, Filter, GroupingSet, LogicalPlan,
-    Operator, TryCast,
+    and, BinaryExpr, Expr, ExprSchemable, Filter, GroupingSet, LogicalPlan, Operator,
 };
 
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion_common::tree_node::{
+    Transformed, TransformedResult, TreeNode, TreeNodeRecursion,
+};
 use datafusion_common::utils::get_at_indices;
 use datafusion_common::{
-    internal_err, plan_datafusion_err, plan_err, Column, DFSchema, DFSchemaRef,
-    OwnedTableReference, Result, ScalarValue, TableReference,
+    internal_err, plan_datafusion_err, plan_err, Column, DFSchema, DFSchemaRef, Result,
+    ScalarValue, TableReference,
 };
 
 use sqlparser::ast::{ExceptSelectItem, ExcludeSelectItem, WildcardAdditionalOptions};
 
 ///  The value to which `COUNT(*)` is expanded to in
 ///  `COUNT(<constant>)` expressions
-pub const COUNT_STAR_EXPANSION: ScalarValue = ScalarValue::UInt8(Some(1));
+pub const COUNT_STAR_EXPANSION: ScalarValue = ScalarValue::Int64(Some(1));
 
 /// Recursively walk a list of expression trees, collecting the unique set of columns
 /// referenced in the expression
+#[deprecated(since = "40.0.0", note = "Expr::add_column_refs instead")]
 pub fn exprlist_to_columns(expr: &[Expr], accum: &mut HashSet<Column>) -> Result<()> {
     for e in expr {
         expr_to_columns(e, accum)?;
@@ -248,7 +249,7 @@ pub fn enumerate_grouping_sets(group_expr: Vec<Expr>) -> Result<Vec<Expr>> {
 
 /// Find all distinct exprs in a list of group by expressions. If the
 /// first element is a `GroupingSet` expression then it must be the only expr.
-pub fn grouping_set_to_exprlist(group_expr: &[Expr]) -> Result<Vec<Expr>> {
+pub fn grouping_set_to_exprlist(group_expr: &[Expr]) -> Result<Vec<&Expr>> {
     if let Some(Expr::GroupingSet(grouping_set)) = group_expr.first() {
         if group_expr.len() > 1 {
             return plan_err!(
@@ -257,14 +258,14 @@ pub fn grouping_set_to_exprlist(group_expr: &[Expr]) -> Result<Vec<Expr>> {
         }
         Ok(grouping_set.distinct_expr())
     } else {
-        Ok(group_expr.to_vec())
+        Ok(group_expr.iter().collect())
     }
 }
 
 /// Recursively walk an expression tree, collecting the unique set of columns
 /// referenced in the expression
 pub fn expr_to_columns(expr: &Expr, accum: &mut HashSet<Column>) -> Result<()> {
-    inspect_expr_pre(expr, |expr| {
+    expr.apply(|expr| {
         match expr {
             Expr::Column(qc) => {
                 accum.insert(qc.clone());
@@ -303,12 +304,12 @@ pub fn expr_to_columns(expr: &Expr, accum: &mut HashSet<Column>) -> Result<()> {
             | Expr::InSubquery(_)
             | Expr::ScalarSubquery(_)
             | Expr::Wildcard { .. }
-            | Expr::GetIndexedField { .. }
             | Expr::Placeholder(_)
             | Expr::OuterReferenceColumn { .. } => {}
         }
-        Ok(())
+        Ok(TreeNodeRecursion::Continue)
     })
+    .map(|_| ())
 }
 
 /// Find excluded columns in the schema, if any
@@ -317,7 +318,7 @@ fn get_excluded_columns(
     opt_exclude: Option<&ExcludeSelectItem>,
     opt_except: Option<&ExceptSelectItem>,
     schema: &DFSchema,
-    qualifier: &Option<TableReference>,
+    qualifier: Option<&TableReference>,
 ) -> Result<Vec<Column>> {
     let mut idents = vec![];
     if let Some(excepts) = opt_except {
@@ -342,8 +343,7 @@ fn get_excluded_columns(
     let mut result = vec![];
     for ident in unique_idents.into_iter() {
         let col_name = ident.value.as_str();
-        let (qualifier, field) =
-            schema.qualified_field_with_name(qualifier.as_ref(), col_name)?;
+        let (qualifier, field) = schema.qualified_field_with_name(qualifier, col_name)?;
         result.push(Column::from((qualifier, field)));
     }
     Ok(result)
@@ -355,12 +355,7 @@ fn get_exprs_except_skipped(
     columns_to_skip: HashSet<Column>,
 ) -> Vec<Expr> {
     if columns_to_skip.is_empty() {
-        schema
-            .iter()
-            .map(|(qualifier, field)| {
-                Expr::Column(Column::from((qualifier, field.as_ref())))
-            })
-            .collect::<Vec<Expr>>()
+        schema.iter().map(Expr::from).collect::<Vec<Expr>>()
     } else {
         schema
             .columns()
@@ -410,7 +405,7 @@ pub fn expand_wildcard(
         ..
     }) = wildcard_options
     {
-        get_excluded_columns(opt_exclude.as_ref(), opt_except.as_ref(), schema, &None)?
+        get_excluded_columns(opt_exclude.as_ref(), opt_except.as_ref(), schema, None)?
     } else {
         vec![]
     };
@@ -421,12 +416,11 @@ pub fn expand_wildcard(
 
 /// Resolves an `Expr::Wildcard` to a collection of qualified `Expr::Column`'s.
 pub fn expand_qualified_wildcard(
-    qualifier: &str,
+    qualifier: &TableReference,
     schema: &DFSchema,
     wildcard_options: Option<&WildcardAdditionalOptions>,
 ) -> Result<Vec<Expr>> {
-    let qualifier = TableReference::from(qualifier);
-    let qualified_indices = schema.fields_indices_with_qualified(&qualifier);
+    let qualified_indices = schema.fields_indices_with_qualified(qualifier);
     let projected_func_dependencies = schema
         .functional_dependencies()
         .project_functional_dependencies(&qualified_indices, qualified_indices.len());
@@ -449,7 +443,7 @@ pub fn expand_qualified_wildcard(
             opt_exclude.as_ref(),
             opt_except.as_ref(),
             schema,
-            &Some(qualifier),
+            Some(qualifier),
         )?
     } else {
         vec![]
@@ -660,7 +654,7 @@ where
     F: Fn(&Expr) -> bool,
 {
     let mut exprs = vec![];
-    expr.apply(&mut |expr| {
+    expr.apply(|expr| {
         if test_fn(expr) {
             if !(exprs.contains(expr)) {
                 exprs.push(expr.clone())
@@ -682,7 +676,7 @@ where
     F: FnMut(&Expr) -> Result<(), E>,
 {
     let mut err = Ok(());
-    expr.apply(&mut |expr| {
+    expr.apply(|expr| {
         if let Err(e) = f(expr) {
             // save the error for later (it may not be a DataFusionError
             err = Err(e);
@@ -729,53 +723,17 @@ pub fn from_plan(
     plan.with_new_exprs(expr.to_vec(), inputs.to_vec())
 }
 
-/// Find all columns referenced from an aggregate query
-fn agg_cols(agg: &Aggregate) -> Vec<Column> {
-    agg.aggr_expr
-        .iter()
-        .chain(&agg.group_expr)
-        .flat_map(find_columns_referenced_by_expr)
-        .collect()
-}
-
-fn exprlist_to_fields_aggregate(
-    exprs: &[Expr],
-    agg: &Aggregate,
-) -> Result<Vec<(Option<OwnedTableReference>, Arc<Field>)>> {
-    let agg_cols = agg_cols(agg);
-    let mut fields = vec![];
-    for expr in exprs {
-        match expr {
-            Expr::Column(c) if agg_cols.iter().any(|x| x == c) => {
-                // resolve against schema of input to aggregate
-                fields.push(expr.to_field(agg.input.schema())?);
-            }
-            _ => fields.push(expr.to_field(&agg.schema)?),
-        }
-    }
-    Ok(fields)
-}
-
 /// Create field meta-data from an expression, for use in a result set schema
-pub fn exprlist_to_fields(
-    exprs: &[Expr],
+pub fn exprlist_to_fields<'a>(
+    exprs: impl IntoIterator<Item = &'a Expr>,
     plan: &LogicalPlan,
-) -> Result<Vec<(Option<OwnedTableReference>, Arc<Field>)>> {
-    // when dealing with aggregate plans we cannot simply look in the aggregate output schema
-    // because it will contain columns representing complex expressions (such a column named
-    // `GROUPING(person.state)` so in order to resolve `person.state` in this case we need to
-    // look at the input to the aggregate instead.
-    let fields = match plan {
-        LogicalPlan::Aggregate(agg) => Some(exprlist_to_fields_aggregate(exprs, agg)),
-        _ => None,
-    };
-    if let Some(fields) = fields {
-        fields
-    } else {
-        // look for exact match in plan's output schema
-        let input_schema = &plan.schema();
-        exprs.iter().map(|e| e.to_field(input_schema)).collect()
-    }
+) -> Result<Vec<(Option<TableReference>, Arc<Field>)>> {
+    // look for exact match in plan's output schema
+    let input_schema = &plan.schema();
+    exprs
+        .into_iter()
+        .map(|e| e.to_field(input_schema))
+        .collect()
 }
 
 /// Convert an expression into Column expression if it's already provided as input plan.
@@ -793,37 +751,21 @@ pub fn exprlist_to_fields(
 /// .aggregate(vec![col("c1")], vec![sum(col("c2"))])?
 /// .project(vec![col("c1"), col("SUM(c2)")?
 /// ```
-pub fn columnize_expr(e: Expr, input_schema: &DFSchema) -> Expr {
-    match e {
-        Expr::Column(_) => e,
-        Expr::OuterReferenceColumn(_, _) => e,
-        Expr::Alias(Alias {
-            expr,
-            relation,
-            name,
-        }) => columnize_expr(*expr, input_schema).alias_qualified(relation, name),
-        Expr::Cast(Cast { expr, data_type }) => Expr::Cast(Cast {
-            expr: Box::new(columnize_expr(*expr, input_schema)),
-            data_type,
-        }),
-        Expr::TryCast(TryCast { expr, data_type }) => Expr::TryCast(TryCast::new(
-            Box::new(columnize_expr(*expr, input_schema)),
-            data_type,
+pub fn columnize_expr(e: Expr, input: &LogicalPlan) -> Result<Expr> {
+    let output_exprs = match input.columnized_output_exprs() {
+        Ok(exprs) if !exprs.is_empty() => exprs,
+        _ => return Ok(e),
+    };
+    let exprs_map: HashMap<&Expr, Column> = output_exprs.into_iter().collect();
+    e.transform_down(|node: Expr| match exprs_map.get(&node) {
+        Some(column) => Ok(Transformed::new(
+            Expr::Column(column.clone()),
+            true,
+            TreeNodeRecursion::Jump,
         )),
-        Expr::ScalarSubquery(_) => e.clone(),
-        _ => match e.display_name() {
-            Ok(name) => {
-                match input_schema.qualified_field_with_unqualified_name(&name) {
-                    Ok((qualifier, field)) => {
-                        Expr::Column(Column::from((qualifier, field)))
-                    }
-                    // expression not provided as input, do not convert to a column reference
-                    Err(_) => e,
-                }
-            }
-            Err(_) => e,
-        },
-    }
+        None => Ok(Transformed::no(node)),
+    })
+    .data()
 }
 
 /// Collect all deeply nested `Expr::Column`'s. They are returned in order of
@@ -838,11 +780,11 @@ pub fn find_column_exprs(exprs: &[Expr]) -> Vec<Expr> {
 
 pub(crate) fn find_columns_referenced_by_expr(e: &Expr) -> Vec<Column> {
     let mut exprs = vec![];
-    inspect_expr_pre(e, |expr| {
+    e.apply(|expr| {
         if let Expr::Column(c) = expr {
             exprs.push(c.clone())
         }
-        Ok(()) as Result<()>
+        Ok(TreeNodeRecursion::Continue)
     })
     // As the closure always returns Ok, this "can't" error
     .expect("Unexpected error");
@@ -854,7 +796,7 @@ pub fn expr_as_column_expr(expr: &Expr, plan: &LogicalPlan) -> Result<Expr> {
     match expr {
         Expr::Column(col) => {
             let (qualifier, field) = plan.schema().qualified_field_from_column(col)?;
-            Ok(Expr::Column(Column::from((qualifier, field))))
+            Ok(Expr::from(Column::from((qualifier, field))))
         }
         _ => Ok(Expr::Column(Column::from_name(expr.display_name()?))),
     }
@@ -867,7 +809,7 @@ pub(crate) fn find_column_indexes_referenced_by_expr(
     schema: &DFSchemaRef,
 ) -> Vec<usize> {
     let mut indexes = vec![];
-    inspect_expr_pre(e, |expr| {
+    e.apply(|expr| {
         match expr {
             Expr::Column(qc) => {
                 if let Ok(idx) = schema.index_of_column(qc) {
@@ -875,11 +817,11 @@ pub(crate) fn find_column_indexes_referenced_by_expr(
                 }
             }
             Expr::Literal(_) => {
-                indexes.push(std::usize::MAX);
+                indexes.push(usize::MAX);
             }
             _ => {}
         }
-        Ok(()) as Result<()>
+        Ok(TreeNodeRecursion::Continue)
     })
     .unwrap();
     indexes
@@ -928,11 +870,11 @@ pub fn can_hash(data_type: &DataType) -> bool {
 
 /// Check whether all columns are from the schema.
 pub fn check_all_columns_from_schema(
-    columns: &HashSet<Column>,
-    schema: DFSchemaRef,
+    columns: &HashSet<&Column>,
+    schema: &DFSchema,
 ) -> Result<bool> {
     for col in columns.iter() {
-        let exist = schema.is_column_from_schema(col)?;
+        let exist = schema.is_column_from_schema(col);
         if !exist {
             return Ok(false);
         }
@@ -953,19 +895,19 @@ pub fn check_all_columns_from_schema(
 pub fn find_valid_equijoin_key_pair(
     left_key: &Expr,
     right_key: &Expr,
-    left_schema: DFSchemaRef,
-    right_schema: DFSchemaRef,
+    left_schema: &DFSchema,
+    right_schema: &DFSchema,
 ) -> Result<Option<(Expr, Expr)>> {
-    let left_using_columns = left_key.to_columns()?;
-    let right_using_columns = right_key.to_columns()?;
+    let left_using_columns = left_key.column_refs();
+    let right_using_columns = right_key.column_refs();
 
     // Conditions like a = 10, will be added to non-equijoin.
     if left_using_columns.is_empty() || right_using_columns.is_empty() {
         return Ok(None);
     }
 
-    if check_all_columns_from_schema(&left_using_columns, left_schema.clone())?
-        && check_all_columns_from_schema(&right_using_columns, right_schema.clone())?
+    if check_all_columns_from_schema(&left_using_columns, left_schema)?
+        && check_all_columns_from_schema(&right_using_columns, right_schema)?
     {
         return Ok(Some((left_key.clone(), right_key.clone())));
     } else if check_all_columns_from_schema(&right_using_columns, left_schema)?
@@ -1054,7 +996,7 @@ fn split_conjunction_impl<'a>(expr: &'a Expr, mut exprs: Vec<&'a Expr>) -> Vec<&
 /// assert_eq!(split_conjunction_owned(expr), split);
 /// ```
 pub fn split_conjunction_owned(expr: Expr) -> Vec<Expr> {
-    split_binary_owned(expr, Operator::And)
+    split_binary_owned(expr, &Operator::And)
 }
 
 /// Splits an owned binary operator tree [`Expr`] such as `A <OP> B <OP> C` => `[A, B, C]`
@@ -1077,19 +1019,19 @@ pub fn split_conjunction_owned(expr: Expr) -> Vec<Expr> {
 /// ];
 ///
 /// // use split_binary_owned to split them
-/// assert_eq!(split_binary_owned(expr, Operator::Plus), split);
+/// assert_eq!(split_binary_owned(expr, &Operator::Plus), split);
 /// ```
-pub fn split_binary_owned(expr: Expr, op: Operator) -> Vec<Expr> {
+pub fn split_binary_owned(expr: Expr, op: &Operator) -> Vec<Expr> {
     split_binary_owned_impl(expr, op, vec![])
 }
 
 fn split_binary_owned_impl(
     expr: Expr,
-    operator: Operator,
+    operator: &Operator,
     mut exprs: Vec<Expr>,
 ) -> Vec<Expr> {
     match expr {
-        Expr::BinaryExpr(BinaryExpr { right, op, left }) if op == operator => {
+        Expr::BinaryExpr(BinaryExpr { right, op, left }) if &op == operator => {
             let exprs = split_binary_owned_impl(*left, operator, exprs);
             split_binary_owned_impl(*right, operator, exprs)
         }
@@ -1106,17 +1048,17 @@ fn split_binary_owned_impl(
 /// Splits an binary operator tree [`Expr`] such as `A <OP> B <OP> C` => `[A, B, C]`
 ///
 /// See [`split_binary_owned`] for more details and an example.
-pub fn split_binary(expr: &Expr, op: Operator) -> Vec<&Expr> {
+pub fn split_binary<'a>(expr: &'a Expr, op: &Operator) -> Vec<&'a Expr> {
     split_binary_impl(expr, op, vec![])
 }
 
 fn split_binary_impl<'a>(
     expr: &'a Expr,
-    operator: Operator,
+    operator: &Operator,
     mut exprs: Vec<&'a Expr>,
 ) -> Vec<&'a Expr> {
     match expr {
-        Expr::BinaryExpr(BinaryExpr { right, op, left }) if *op == operator => {
+        Expr::BinaryExpr(BinaryExpr { right, op, left }) if op == operator => {
             let exprs = split_binary_impl(left, operator, exprs);
             split_binary_impl(right, operator, exprs)
         }
@@ -1151,7 +1093,7 @@ fn split_binary_impl<'a>(
 /// assert_eq!(conjunction(split), Some(expr));
 /// ```
 pub fn conjunction(filters: impl IntoIterator<Item = Expr>) -> Option<Expr> {
-    filters.into_iter().reduce(|accum, expr| accum.and(expr))
+    filters.into_iter().reduce(Expr::and)
 }
 
 /// Combines an array of filter expressions into a single filter
@@ -1159,12 +1101,41 @@ pub fn conjunction(filters: impl IntoIterator<Item = Expr>) -> Option<Expr> {
 /// logical OR.
 ///
 /// Returns None if the filters array is empty.
+///
+/// # Example
+/// ```
+/// # use datafusion_expr::{col, lit};
+/// # use datafusion_expr::utils::disjunction;
+/// // a=1 OR b=2
+/// let expr = col("a").eq(lit(1)).or(col("b").eq(lit(2)));
+///
+/// // [a=1, b=2]
+/// let split = vec![
+///   col("a").eq(lit(1)),
+///   col("b").eq(lit(2)),
+/// ];
+///
+/// // use disjuncton to join them together with `OR`
+/// assert_eq!(disjunction(split), Some(expr));
+/// ```
 pub fn disjunction(filters: impl IntoIterator<Item = Expr>) -> Option<Expr> {
-    filters.into_iter().reduce(|accum, expr| accum.or(expr))
+    filters.into_iter().reduce(Expr::or)
 }
 
-/// returns a new [LogicalPlan] that wraps `plan` in a [LogicalPlan::Filter] with
-/// its predicate be all `predicates` ANDed.
+/// Returns a new [LogicalPlan] that filters the output of  `plan` with a
+/// [LogicalPlan::Filter] with all `predicates` ANDed.
+///
+/// # Example
+/// Before:
+/// ```text
+/// plan
+/// ```
+///
+/// After:
+/// ```text
+/// Filter(predicate)
+///   plan
+/// ```
 pub fn add_filter(plan: LogicalPlan, predicates: &[&Expr]) -> Result<LogicalPlan> {
     // reduce filters to a single filter with an AND
     let predicate = predicates
@@ -1240,12 +1211,49 @@ pub fn merge_schema(inputs: Vec<&LogicalPlan>) -> DFSchema {
     }
 }
 
+/// Build state name. State is the intermidiate state of the aggregate function.
+pub fn format_state_name(name: &str, state_name: &str) -> String {
+    format!("{name}[{state_name}]")
+}
+
+/// Represents the sensitivity of an aggregate expression to ordering.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum AggregateOrderSensitivity {
+    /// Indicates that the aggregate expression is insensitive to ordering.
+    /// Ordering at the input is not important for the result of the aggregator.
+    Insensitive,
+    /// Indicates that the aggregate expression has a hard requirement on ordering.
+    /// The aggregator can not produce a correct result unless its ordering
+    /// requirement is satisfied.
+    HardRequirement,
+    /// Indicates that ordering is beneficial for the aggregate expression in terms
+    /// of evaluation efficiency. The aggregator can produce its result efficiently
+    /// when its required ordering is satisfied; however, it can still produce the
+    /// correct result (albeit less efficiently) when its required ordering is not met.
+    Beneficial,
+}
+
+impl AggregateOrderSensitivity {
+    pub fn is_insensitive(&self) -> bool {
+        self.eq(&AggregateOrderSensitivity::Insensitive)
+    }
+
+    pub fn is_beneficial(&self) -> bool {
+        self.eq(&AggregateOrderSensitivity::Beneficial)
+    }
+
+    pub fn hard_requires(&self) -> bool {
+        self.eq(&AggregateOrderSensitivity::HardRequirement)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        col, cube, expr, expr_vec_fmt, grouping_set, lit, rollup, AggregateFunction,
-        WindowFrame, WindowFunctionDefinition,
+        col, cube, expr, expr_vec_fmt, grouping_set, lit, rollup,
+        test::function_stub::sum_udaf, AggregateFunction, Cast, WindowFrame,
+        WindowFunctionDefinition,
     };
 
     #[test]
@@ -1283,7 +1291,7 @@ mod tests {
             None,
         ));
         let sum4 = Expr::WindowFunction(expr::WindowFunction::new(
-            WindowFunctionDefinition::AggregateFunction(AggregateFunction::Sum),
+            WindowFunctionDefinition::AggregateUDF(sum_udaf()),
             vec![col("age")],
             vec![],
             vec![],
@@ -1330,7 +1338,7 @@ mod tests {
             None,
         ));
         let sum4 = Expr::WindowFunction(expr::WindowFunction::new(
-            WindowFunctionDefinition::AggregateFunction(AggregateFunction::Sum),
+            WindowFunctionDefinition::AggregateUDF(sum_udaf()),
             vec![col("age")],
             vec![],
             vec![name_desc.clone(), age_asc.clone(), created_at_desc.clone()],
@@ -1373,7 +1381,7 @@ mod tests {
                 None,
             )),
             Expr::WindowFunction(expr::WindowFunction::new(
-                WindowFunctionDefinition::AggregateFunction(AggregateFunction::Sum),
+                WindowFunctionDefinition::AggregateUDF(sum_udaf()),
                 vec![col("age")],
                 vec![],
                 vec![
@@ -1604,13 +1612,13 @@ mod tests {
     #[test]
     fn test_split_binary_owned() {
         let expr = col("a");
-        assert_eq!(split_binary_owned(expr.clone(), Operator::And), vec![expr]);
+        assert_eq!(split_binary_owned(expr.clone(), &Operator::And), vec![expr]);
     }
 
     #[test]
     fn test_split_binary_owned_two() {
         assert_eq!(
-            split_binary_owned(col("a").eq(lit(5)).and(col("b")), Operator::And),
+            split_binary_owned(col("a").eq(lit(5)).and(col("b")), &Operator::And),
             vec![col("a").eq(lit(5)), col("b")]
         );
     }
@@ -1620,7 +1628,7 @@ mod tests {
         let expr = col("a").eq(lit(5)).or(col("b"));
         assert_eq!(
             // expr is connected by OR, but pass in AND
-            split_binary_owned(expr.clone(), Operator::And),
+            split_binary_owned(expr.clone(), &Operator::And),
             vec![expr]
         );
     }

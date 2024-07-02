@@ -192,7 +192,7 @@ impl FilterExec {
         let mut eq_properties = input.equivalence_properties().clone();
         let (equal_pairs, _) = collect_columns_from_predicate(predicate);
         for (lhs, rhs) in equal_pairs {
-            eq_properties.add_equal_conditions(lhs, rhs)
+            eq_properties.add_equal_conditions(lhs, rhs)?
         }
         // Add the columns that have only one viable value (singleton) after
         // filtering to constants.
@@ -242,8 +242,8 @@ impl ExecutionPlan for FilterExec {
         &self.cache
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![self.input.clone()]
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
@@ -433,20 +433,15 @@ pub type EqualAndNonEqual<'a> =
 
 #[cfg(test)]
 mod tests {
-    use std::iter::Iterator;
-    use std::sync::Arc;
-
     use super::*;
+    use crate::empty::EmptyExec;
     use crate::expressions::*;
     use crate::test;
     use crate::test::exec::StatisticsExec;
-    use crate::ExecutionPlan;
 
-    use crate::empty::EmptyExec;
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{Field, Schema};
     use arrow_schema::{UnionFields, UnionMode};
-    use datafusion_common::{ColumnStatistics, ScalarValue};
-    use datafusion_expr::Operator;
+    use datafusion_common::ScalarValue;
 
     #[tokio::test]
     async fn collect_columns_predicates() -> Result<()> {

@@ -63,7 +63,6 @@ fn generate_file(tempdir: &TempDir, props: WriterProperties) -> TestParquetFile 
     test_parquet_file
 }
 
-#[cfg(not(target_family = "windows"))]
 #[tokio::test]
 async fn single_file() {
     // Only create the parquet file once as it is fairly large
@@ -222,7 +221,6 @@ async fn single_file() {
     case.run().await;
 }
 
-#[cfg(not(target_family = "windows"))]
 #[tokio::test]
 async fn single_file_small_data_pages() {
     let tempdir = TempDir::new().unwrap();
@@ -531,7 +529,7 @@ impl<'a> TestCase<'a> {
 
         // verify expected pushdown
         let metrics =
-            TestParquetFile::parquet_metrics(exec).expect("found parquet metrics");
+            TestParquetFile::parquet_metrics(&exec).expect("found parquet metrics");
 
         let pushdown_expected = if scan_options.pushdown_filters {
             self.pushdown_expected

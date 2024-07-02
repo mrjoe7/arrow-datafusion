@@ -466,7 +466,7 @@ query error Cannot cast string '24:01:02' to value of Time64\(Nanosecond\) type
 SELECT TIME '24:01:02' as time;
 
 # invalid timezone
-query error Arrow error: Parser error: Invalid timezone "ZZ": 'ZZ' is not a valid timezone
+query error Arrow error: Parser error: Invalid timezone "ZZ": failed to parse timezone
 SELECT TIMESTAMP '2023-12-05T21:58:10.45ZZ';
 
 statement ok
@@ -538,7 +538,7 @@ select to_timestamp_seconds(cast (1 as int));
 ##########
 
 # invalid second arg type
-query error DataFusion error: Error during planning: No function matches the given name and argument types 'date_bin\(Interval\(MonthDayNano\), Int64, Timestamp\(Nanosecond, None\)\)'\.
+query error
 SELECT DATE_BIN(INTERVAL '0 second', 25, TIMESTAMP '1970-01-01T00:00:00Z')
 
 # not support interval 0
@@ -1328,7 +1328,7 @@ from timestamp_utc order by ts;
 
 
 # date trunc in a timezone with DST across DST boundary (note the date-trunc hour value repeats)
-# Test for https://github.com/apache/arrow-datafusion/issues/8899
+# Test for https://github.com/apache/datafusion/issues/8899
 query PPPP
 select ts, date_trunc('month', ts), date_trunc('day', ts), date_trunc('hour', ts)
 from timestamp_berlin order by ts;
@@ -1412,7 +1412,7 @@ from timestamp_utc order by ts;
 
 
 # date trunc in a timezone with DST across DST boundary (note there is no midnight on 2018-11-04)
-# Test for https://github.com/apache/arrow-datafusion/issues/8899
+# Test for https://github.com/apache/datafusion/issues/8899
 query PPPP
 select ts, date_trunc('month', ts), date_trunc('day', ts), date_trunc('hour', ts)
 from timestamp_sao_paulo order by ts;
@@ -1625,7 +1625,7 @@ drop table ts_data_secs
 
 
 ##########
-## Timezone impact on builtin scalar functions
+## Timezone impact on scalar functions
 #
 # server time = +07
 ##########
@@ -1690,7 +1690,7 @@ SELECT date_part('hour', TIMESTAMPTZ '2000-01-01T01:01:01Z') as part
 
 
 ##########
-## Timezone impact on builtin scalar functions
+## Timezone impact on scalar functions
 #
 # server time = UTC
 ##########
@@ -1773,7 +1773,7 @@ SELECT date_part('hour', TIMESTAMPTZ '2000-01-01T01:01:01+07') as part
 
 
 ##########
-## Timezone impact on builtin scalar functions
+## Timezone impact on scalar functions
 #
 # irregular offsets
 ##########
@@ -2774,6 +2774,26 @@ SELECT '2000-12-01 04:04:12' AT TIME ZONE 'America/New_York';
 ----
 2000-12-01T04:04:12-05:00
 
+query P
+SELECT '2024-03-30 00:00:20' AT TIME ZONE 'Europe/Brussels';
+----
+2024-03-30T00:00:20+01:00
+
+query P
+SELECT '2024-03-30 00:00:20'::timestamp AT TIME ZONE 'Europe/Brussels';
+----
+2024-03-30T00:00:20+01:00
+
+query P
+SELECT '2024-03-30 00:00:20Z' AT TIME ZONE 'Europe/Brussels';
+----
+2024-03-30T01:00:20+01:00
+
+query P
+SELECT '2024-03-30 00:00:20Z'::timestamp AT TIME ZONE 'Europe/Brussels';
+----
+2024-03-30T00:00:20+01:00
+
 ## date-time strings that already have a explicit timezone can be used with AT TIME ZONE
 
 # same time zone as provided date-time
@@ -2795,3 +2815,32 @@ SELECT '2000-12-01 04:04:12' AT TIME ZONE 'America/New York';
 # abbreviated timezone is not supported
 statement error
 SELECT '2023-03-12 02:00:00' AT TIME ZONE 'EDT';
+
+# Test current_time without parentheses
+query B
+select current_time = current_time;
+----
+true
+
+# Test temporal coercion for UTC
+query ?
+select arrow_cast('2024-06-17T11:00:00', 'Timestamp(Nanosecond, Some("UTC"))') - arrow_cast('2024-06-17T12:00:00', 'Timestamp(Microsecond, Some("UTC"))');
+----
+0 days -1 hours 0 mins 0.000000 secs
+
+query ?
+select arrow_cast('2024-06-17T13:00:00', 'Timestamp(Nanosecond, Some("+00:00"))') - arrow_cast('2024-06-17T12:00:00', 'Timestamp(Microsecond, Some("UTC"))');
+----
+0 days 1 hours 0 mins 0.000000 secs
+
+query ?
+select arrow_cast('2024-06-17T13:00:00', 'Timestamp(Nanosecond, Some("UTC"))') - arrow_cast('2024-06-17T12:00:00', 'Timestamp(Microsecond, Some("+00:00"))');
+----
+0 days 1 hours 0 mins 0.000000 secs
+
+# not supported: coercion across timezones
+query error
+select arrow_cast('2024-06-17T13:00:00', 'Timestamp(Nanosecond, Some("UTC"))') - arrow_cast('2024-06-17T12:00:00', 'Timestamp(Microsecond, Some("+01:00"))');
+
+query error
+select arrow_cast('2024-06-17T13:00:00', 'Timestamp(Nanosecond, Some("+00:00"))') - arrow_cast('2024-06-17T12:00:00', 'Timestamp(Microsecond, Some("+01:00"))');

@@ -22,7 +22,7 @@ use crate::PhysicalExpr;
 
 use arrow::datatypes::SchemaRef;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
-use datafusion_common::Result;
+use datafusion_common::{internal_err, Result};
 
 /// Stores the mapping between source expressions and target expressions for a
 /// projection.
@@ -58,7 +58,7 @@ impl ProjectionMapping {
                 let target_expr = Arc::new(Column::new(name, expr_idx)) as _;
                 expression
                     .clone()
-                    .transform_down(&|e| match e.as_any().downcast_ref::<Column>() {
+                    .transform_down(|e| match e.as_any().downcast_ref::<Column>() {
                         Some(col) => {
                             // Sometimes, an expression and its name in the input_schema
                             // doesn't match. This can cause problems, so we make sure
@@ -66,6 +66,10 @@ impl ProjectionMapping {
                             // Conceptually, `source_expr` and `expression` should be the same.
                             let idx = col.index();
                             let matching_input_field = input_schema.field(idx);
+                            if col.name() != matching_input_field.name() {
+                                return internal_err!("Input field name {} does not match with the projection expression {}",
+                                    matching_input_field.name(),col.name())
+                                }
                             let matching_input_column =
                                 Column::new(matching_input_field.name(), idx);
                             Ok(Transformed::yes(Arc::new(matching_input_column)))
@@ -109,8 +113,6 @@ impl ProjectionMapping {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
     use crate::equivalence::tests::{
         apply_projection, convert_to_orderings, convert_to_orderings_owned,
@@ -119,14 +121,14 @@ mod tests {
     };
     use crate::equivalence::EquivalenceProperties;
     use crate::expressions::{col, BinaryExpr};
-    use crate::functions::create_physical_expr;
+    use crate::udf::create_physical_expr;
+    use crate::utils::tests::TestScalarUDF;
     use crate::PhysicalSortExpr;
 
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow_schema::{SortOptions, TimeUnit};
-    use datafusion_common::Result;
-    use datafusion_expr::execution_props::ExecutionProps;
-    use datafusion_expr::{BuiltinScalarFunction, Operator};
+    use datafusion_common::DFSchema;
+    use datafusion_expr::{Operator, ScalarUDF};
 
     use itertools::Itertools;
 
@@ -646,11 +648,13 @@ mod tests {
             col_b.clone(),
         )) as Arc<dyn PhysicalExpr>;
 
+        let test_fun = ScalarUDF::new_from_impl(TestScalarUDF::new());
         let round_c = &create_physical_expr(
-            &BuiltinScalarFunction::Round,
+            &test_fun,
             &[col_c.clone()],
             &schema,
-            &ExecutionProps::default(),
+            &[],
+            &DFSchema::empty(),
         )?;
 
         let option_asc = SortOptions {
@@ -934,7 +938,7 @@ mod tests {
         for (orderings, equal_columns, expected) in test_cases {
             let mut eq_properties = EquivalenceProperties::new(schema.clone());
             for (lhs, rhs) in equal_columns {
-                eq_properties.add_equal_conditions(lhs, rhs);
+                eq_properties.add_equal_conditions(lhs, rhs)?;
             }
 
             let orderings = convert_to_orderings(&orderings);
@@ -973,11 +977,13 @@ mod tests {
             let table_data_with_properties =
                 generate_table_for_eq_properties(&eq_properties, N_ELEMENTS, N_DISTINCT)?;
             // Floor(a)
+            let test_fun = ScalarUDF::new_from_impl(TestScalarUDF::new());
             let floor_a = create_physical_expr(
-                &BuiltinScalarFunction::Floor,
+                &test_fun,
                 &[col("a", &test_schema)?],
                 &test_schema,
-                &ExecutionProps::default(),
+                &[],
+                &DFSchema::empty(),
             )?;
             // a + b
             let a_plus_b = Arc::new(BinaryExpr::new(
@@ -1049,11 +1055,13 @@ mod tests {
             let table_data_with_properties =
                 generate_table_for_eq_properties(&eq_properties, N_ELEMENTS, N_DISTINCT)?;
             // Floor(a)
+            let test_fun = ScalarUDF::new_from_impl(TestScalarUDF::new());
             let floor_a = create_physical_expr(
-                &BuiltinScalarFunction::Floor,
+                &test_fun,
                 &[col("a", &test_schema)?],
                 &test_schema,
-                &ExecutionProps::default(),
+                &[],
+                &DFSchema::empty(),
             )?;
             // a + b
             let a_plus_b = Arc::new(BinaryExpr::new(

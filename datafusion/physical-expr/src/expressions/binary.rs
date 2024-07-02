@@ -20,27 +20,26 @@ mod kernels;
 use std::hash::{Hash, Hasher};
 use std::{any::Any, sync::Arc};
 
-use crate::expressions::datum::{apply, apply_cmp};
 use crate::intervals::cp_solver::{propagate_arithmetic, propagate_comparison};
 use crate::physical_expr::down_cast_any_ref;
-use crate::sort_properties::SortProperties;
 use crate::PhysicalExpr;
 
 use arrow::array::*;
 use arrow::compute::kernels::boolean::{and_kleene, not, or_kleene};
 use arrow::compute::kernels::cmp::*;
-use arrow::compute::kernels::comparison::regexp_is_match_utf8;
-use arrow::compute::kernels::comparison::regexp_is_match_utf8_scalar;
+use arrow::compute::kernels::comparison::{
+    regexp_is_match_utf8, regexp_is_match_utf8_scalar,
+};
 use arrow::compute::kernels::concat_elements::concat_elements_utf8;
 use arrow::compute::{cast, ilike, like, nilike, nlike};
 use arrow::datatypes::*;
-use arrow::record_batch::RecordBatch;
-
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::{internal_err, Result, ScalarValue};
 use datafusion_expr::interval_arithmetic::{apply_operator, Interval};
+use datafusion_expr::sort_properties::ExprProperties;
 use datafusion_expr::type_coercion::binary::get_result_type;
 use datafusion_expr::{ColumnarValue, Operator};
+use datafusion_physical_expr_common::datum::{apply, apply_cmp, apply_cmp_for_nested};
 
 use kernels::{
     bitwise_and_dyn, bitwise_and_dyn_scalar, bitwise_or_dyn, bitwise_or_dyn_scalar,
@@ -266,6 +265,13 @@ impl PhysicalExpr for BinaryExpr {
         let schema = batch.schema();
         let input_schema = schema.as_ref();
 
+        if left_data_type.is_nested() {
+            if right_data_type != left_data_type {
+                return internal_err!("type mismatch");
+            }
+            return apply_cmp_for_nested(&self.op, &lhs, &rhs);
+        }
+
         match self.op {
             Operator::Plus => return apply(&lhs, &rhs, add_wrapping),
             Operator::Minus => return apply(&lhs, &rhs, sub_wrapping),
@@ -313,8 +319,8 @@ impl PhysicalExpr for BinaryExpr {
             .map(ColumnarValue::Array)
     }
 
-    fn children(&self) -> Vec<Arc<dyn PhysicalExpr>> {
-        vec![self.left.clone(), self.right.clone()]
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        vec![&self.left, &self.right]
     }
 
     fn with_new_children(
@@ -323,7 +329,7 @@ impl PhysicalExpr for BinaryExpr {
     ) -> Result<Arc<dyn PhysicalExpr>> {
         Ok(Arc::new(BinaryExpr::new(
             children[0].clone(),
-            self.op,
+            self.op.clone(),
             children[1].clone(),
         )))
     }
@@ -443,17 +449,45 @@ impl PhysicalExpr for BinaryExpr {
         self.hash(&mut s);
     }
 
-    /// For each operator, [`BinaryExpr`] has distinct ordering rules.
-    /// TODO: There may be rules specific to some data types (such as division and multiplication on unsigned integers)
-    fn get_ordering(&self, children: &[SortProperties]) -> SortProperties {
-        let (left_child, right_child) = (&children[0], &children[1]);
+    /// For each operator, [`BinaryExpr`] has distinct rules.
+    /// TODO: There may be rules specific to some data types and expression ranges.
+    fn get_properties(&self, children: &[ExprProperties]) -> Result<ExprProperties> {
+        let (l_order, l_range) = (children[0].sort_properties, &children[0].range);
+        let (r_order, r_range) = (children[1].sort_properties, &children[1].range);
         match self.op() {
-            Operator::Plus => left_child.add(right_child),
-            Operator::Minus => left_child.sub(right_child),
-            Operator::Gt | Operator::GtEq => left_child.gt_or_gteq(right_child),
-            Operator::Lt | Operator::LtEq => right_child.gt_or_gteq(left_child),
-            Operator::And | Operator::Or => left_child.and_or(right_child),
-            _ => SortProperties::Unordered,
+            Operator::Plus => Ok(ExprProperties {
+                sort_properties: l_order.add(&r_order),
+                range: l_range.add(r_range)?,
+            }),
+            Operator::Minus => Ok(ExprProperties {
+                sort_properties: l_order.sub(&r_order),
+                range: l_range.sub(r_range)?,
+            }),
+            Operator::Gt => Ok(ExprProperties {
+                sort_properties: l_order.gt_or_gteq(&r_order),
+                range: l_range.gt(r_range)?,
+            }),
+            Operator::GtEq => Ok(ExprProperties {
+                sort_properties: l_order.gt_or_gteq(&r_order),
+                range: l_range.gt_eq(r_range)?,
+            }),
+            Operator::Lt => Ok(ExprProperties {
+                sort_properties: r_order.gt_or_gteq(&l_order),
+                range: l_range.lt(r_range)?,
+            }),
+            Operator::LtEq => Ok(ExprProperties {
+                sort_properties: r_order.gt_or_gteq(&l_order),
+                range: l_range.lt_eq(r_range)?,
+            }),
+            Operator::And => Ok(ExprProperties {
+                sort_properties: r_order.and_or(&l_order),
+                range: l_range.and(r_range)?,
+            }),
+            Operator::Or => Ok(ExprProperties {
+                sort_properties: r_order.and_or(&l_order),
+                range: l_range.or(r_range)?,
+            }),
+            _ => Ok(ExprProperties::new_unknown()),
         }
     }
 }
@@ -624,10 +658,8 @@ pub fn binary(
 mod tests {
     use super::*;
     use crate::expressions::{col, lit, try_cast, Literal};
-    use arrow::datatypes::{
-        ArrowNumericType, Decimal128Type, Field, Int32Type, SchemaRef,
-    };
-    use datafusion_common::{plan_datafusion_err, Result};
+
+    use datafusion_common::plan_datafusion_err;
     use datafusion_expr::type_coercion::binary::get_input_types;
 
     /// Performs a binary operation, applying any type coercion necessary
@@ -2940,7 +2972,7 @@ mod tests {
 
     #[test]
     fn relatively_deeply_nested() {
-        // Reproducer for https://github.com/apache/arrow-datafusion/issues/419
+        // Reproducer for https://github.com/apache/datafusion/issues/419
 
         // where even relatively shallow binary expressions overflowed
         // the stack in debug builds
@@ -3408,7 +3440,7 @@ mod tests {
         .unwrap();
         // is distinct: float64array is distinct decimal array
         // TODO: now we do not refactor the `is distinct or is not distinct` rule of coercion.
-        // traced by https://github.com/apache/arrow-datafusion/issues/1590
+        // traced by https://github.com/apache/datafusion/issues/1590
         // the decimal array will be casted to float64array
         apply_logic_op(
             &schema,

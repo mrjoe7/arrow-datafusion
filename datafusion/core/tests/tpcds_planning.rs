@@ -231,7 +231,7 @@ async fn tpcds_logical_q40() -> Result<()> {
 #[tokio::test]
 #[ignore]
 // Optimizer rule 'scalar_subquery_to_join' failed: Optimizing disjunctions not supported!
-// issue: https://github.com/apache/arrow-datafusion/issues/5368
+// issue: https://github.com/apache/datafusion/issues/5368
 async fn tpcds_logical_q41() -> Result<()> {
     create_logical_plan(41).await
 }
@@ -846,7 +846,6 @@ async fn tpcds_physical_q63() -> Result<()> {
     create_physical_plan(63).await
 }
 
-#[ignore] // thread 'q64' has overflowed its stack
 #[tokio::test]
 async fn tpcds_physical_q64() -> Result<()> {
     create_physical_plan(64).await
@@ -1045,7 +1044,10 @@ async fn regression_test(query_no: u8, create_physical: bool) -> Result<()> {
     for table in &tables {
         ctx.register_table(
             table.name.as_str(),
-            Arc::new(MemTable::try_new(Arc::new(table.schema.clone()), vec![])?),
+            Arc::new(MemTable::try_new(
+                Arc::new(table.schema.clone()),
+                vec![vec![]],
+            )?),
         )?;
     }
 

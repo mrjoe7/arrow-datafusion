@@ -21,6 +21,7 @@ use arrow::array::{ArrayRef, OffsetSizeTrait};
 use arrow::datatypes::DataType;
 
 use datafusion_common::{exec_err, Result};
+use datafusion_expr::function::Hint;
 use datafusion_expr::TypeSignature::*;
 use datafusion_expr::{ColumnarValue, Volatility};
 use datafusion_expr::{ScalarUDFImpl, Signature};
@@ -37,6 +38,12 @@ fn ltrim<T: OffsetSizeTrait>(args: &[ArrayRef]) -> Result<ArrayRef> {
 #[derive(Debug)]
 pub struct LtrimFunc {
     signature: Signature,
+}
+
+impl Default for LtrimFunc {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LtrimFunc {
@@ -70,8 +77,14 @@ impl ScalarUDFImpl for LtrimFunc {
 
     fn invoke(&self, args: &[ColumnarValue]) -> Result<ColumnarValue> {
         match args[0].data_type() {
-            DataType::Utf8 => make_scalar_function(ltrim::<i32>, vec![])(args),
-            DataType::LargeUtf8 => make_scalar_function(ltrim::<i64>, vec![])(args),
+            DataType::Utf8 => make_scalar_function(
+                ltrim::<i32>,
+                vec![Hint::Pad, Hint::AcceptsSingular],
+            )(args),
+            DataType::LargeUtf8 => make_scalar_function(
+                ltrim::<i64>,
+                vec![Hint::Pad, Hint::AcceptsSingular],
+            )(args),
             other => exec_err!("Unsupported data type {other:?} for function ltrim"),
         }
     }

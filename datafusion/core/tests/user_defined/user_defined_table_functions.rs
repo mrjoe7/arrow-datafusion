@@ -90,6 +90,21 @@ async fn test_simple_read_csv_udtf() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn test_deregister_udtf() -> Result<()> {
+    let ctx = SessionContext::new();
+
+    ctx.register_udtf("read_csv", Arc::new(SimpleCsvTableFunc {}));
+
+    assert!(ctx.state().table_functions().contains_key("read_csv"));
+
+    ctx.deregister_udtf("read_csv");
+
+    assert!(!ctx.state().table_functions().contains_key("read_csv"));
+
+    Ok(())
+}
+
 struct SimpleCsvTable {
     schema: SchemaRef,
     exprs: Vec<Expr>,
@@ -156,8 +171,8 @@ impl SimpleCsvTable {
         let logical_plan = Projection::try_new(
             vec![columnize_expr(
                 normalize_col(self.exprs[0].clone(), &plan)?,
-                plan.schema(),
-            )],
+                &plan,
+            )?],
             Arc::new(plan),
         )
         .map(LogicalPlan::Projection)?;
@@ -185,7 +200,7 @@ impl TableFunctionImpl for SimpleCsvTableFunc {
         for expr in exprs {
             match expr {
                 Expr::Literal(ScalarValue::Utf8(Some(ref path))) => {
-                    filepath = path.clone()
+                    filepath.clone_from(path);
                 }
                 expr => new_exprs.push(expr.clone()),
             }

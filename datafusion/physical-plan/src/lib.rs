@@ -19,6 +19,9 @@
 
 use std::any::Any;
 use std::fmt::Debug;
+use std::fs::File;
+use std::io::BufReader;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::coalesce_partitions::CoalescePartitionsExec;
@@ -28,16 +31,18 @@ use crate::repartition::RepartitionExec;
 use crate::sorts::sort_preserving_merge::SortPreservingMergeExec;
 
 use arrow::datatypes::SchemaRef;
+use arrow::ipc::reader::FileReader;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::utils::DataPtr;
-use datafusion_common::Result;
+use datafusion_common::{exec_datafusion_err, Result};
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::{
     EquivalenceProperties, LexOrdering, PhysicalSortExpr, PhysicalSortRequirement,
 };
 
 use futures::stream::TryStreamExt;
+use log::debug;
+use tokio::sync::mpsc::Sender;
 use tokio::task::JoinSet;
 
 mod ordering;
@@ -66,7 +71,6 @@ pub mod sorts;
 pub mod stream;
 pub mod streaming;
 pub mod tree_node;
-pub mod udaf;
 pub mod union;
 pub mod unnest;
 pub mod values;
@@ -89,8 +93,18 @@ pub use datafusion_physical_expr::{
 };
 
 // Backwards compatibility
+use crate::common::IPCWriter;
 pub use crate::stream::EmptyRecordBatchStream;
+use crate::stream::RecordBatchReceiverStream;
+use datafusion_execution::disk_manager::RefCountedTempFile;
+use datafusion_execution::memory_pool::human_readable_size;
 pub use datafusion_execution::{RecordBatchStream, SendableRecordBatchStream};
+
+pub mod udaf {
+    pub use datafusion_physical_expr_common::aggregate::{
+        create_aggregate_expr, AggregateFunctionExpr,
+    };
+}
 
 /// Represent nodes in the DataFusion Physical Plan.
 ///
@@ -113,7 +127,20 @@ pub use datafusion_execution::{RecordBatchStream, SendableRecordBatchStream};
 /// [`required_input_ordering`]: ExecutionPlan::required_input_ordering
 pub trait ExecutionPlan: Debug + DisplayAs + Send + Sync {
     /// Short name for the ExecutionPlan, such as 'ParquetExec'.
-    fn name(&self) -> &'static str {
+    ///
+    /// Implementation note: this method can just proxy to
+    /// [`static_name`](ExecutionPlan::static_name) if no special action is
+    /// needed. It doesn't provide a default implementation like that because
+    /// this method doesn't require the `Sized` constrain to allow a wilder
+    /// range of use cases.
+    fn name(&self) -> &str;
+
+    /// Short name for the ExecutionPlan, such as 'ParquetExec'.
+    /// Like [`name`](ExecutionPlan::name) but can be called without an instance.
+    fn static_name() -> &'static str
+    where
+        Self: Sized,
+    {
         let full_name = std::any::type_name::<Self>();
         let maybe_start_idx = full_name.rfind(':');
         match maybe_start_idx {
@@ -121,6 +148,7 @@ pub trait ExecutionPlan: Debug + DisplayAs + Send + Sync {
             None => "UNKNOWN",
         }
     }
+
     /// Returns the execution plan as [`Any`] so that it can be
     /// downcast to a specific implementation.
     fn as_any(&self) -> &dyn Any;
@@ -199,7 +227,7 @@ pub trait ExecutionPlan: Debug + DisplayAs + Send + Sync {
     /// The returned list will be empty for leaf nodes such as scans, will contain
     /// a single value for unary nodes, or two values for binary nodes (such as
     /// joins).
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>>;
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>>;
 
     /// Returns a new `ExecutionPlan` where all existing children were replaced
     /// by the `children`, in order
@@ -574,7 +602,7 @@ impl PlanProperties {
         execution_mode: ExecutionMode,
     ) -> Self {
         // Output ordering can be derived from `eq_properties`.
-        let output_ordering = eq_properties.oeq_class().output_ordering();
+        let output_ordering = eq_properties.output_ordering();
         Self {
             eq_properties,
             partitioning,
@@ -599,7 +627,7 @@ impl PlanProperties {
     pub fn with_eq_properties(mut self, eq_properties: EquivalenceProperties) -> Self {
         // Changing equivalence properties also changes output ordering, so
         // make sure to overwrite it:
-        self.output_ordering = eq_properties.oeq_class().output_ordering();
+        self.output_ordering = eq_properties.output_ordering();
         self.eq_properties = eq_properties;
         self
     }
@@ -667,7 +695,7 @@ pub fn with_new_children_if_necessary(
         || children
             .iter()
             .zip(old_children.iter())
-            .any(|(c1, c2)| !Arc::data_ptr_eq(c1, c2))
+            .any(|(c1, c2)| !Arc::ptr_eq(c1, c2))
     {
         plan.with_new_children(children)
     } else {
@@ -782,9 +810,56 @@ pub fn get_plan_string(plan: &Arc<dyn ExecutionPlan>) -> Vec<String> {
     actual.iter().map(|elem| elem.to_string()).collect()
 }
 
-#[cfg(test)]
-#[allow(clippy::single_component_path_imports)]
-use rstest_reuse;
+/// Read spilled batches from the disk
+///
+/// `path` - temp file
+/// `schema` - batches schema, should be the same across batches
+/// `buffer` - internal buffer of capacity batches
+pub fn read_spill_as_stream(
+    path: RefCountedTempFile,
+    schema: SchemaRef,
+    buffer: usize,
+) -> Result<SendableRecordBatchStream> {
+    let mut builder = RecordBatchReceiverStream::builder(schema, buffer);
+    let sender = builder.tx();
+
+    builder.spawn_blocking(move || read_spill(sender, path.path()));
+
+    Ok(builder.build())
+}
+
+/// Spills in-memory `batches` to disk.
+///
+/// Returns total number of the rows spilled to disk.
+pub fn spill_record_batches(
+    batches: Vec<RecordBatch>,
+    path: PathBuf,
+    schema: SchemaRef,
+) -> Result<usize> {
+    let mut writer = IPCWriter::new(path.as_ref(), schema.as_ref())?;
+    for batch in batches {
+        writer.write(&batch)?;
+    }
+    writer.finish()?;
+    debug!(
+        "Spilled {} batches of total {} rows to disk, memory released {}",
+        writer.num_batches,
+        writer.num_rows,
+        human_readable_size(writer.num_bytes),
+    );
+    Ok(writer.num_rows)
+}
+
+fn read_spill(sender: Sender<Result<RecordBatch>>, path: &Path) -> Result<()> {
+    let file = BufReader::new(File::open(path)?);
+    let reader = FileReader::try_new(file, None)?;
+    for batch in reader {
+        sender
+            .blocking_send(batch.map_err(Into::into))
+            .map_err(|e| exec_datafusion_err!("{e}"))?;
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -817,6 +892,10 @@ mod tests {
     }
 
     impl ExecutionPlan for EmptyExec {
+        fn name(&self) -> &'static str {
+            Self::static_name()
+        }
+
         fn as_any(&self) -> &dyn Any {
             self
         }
@@ -825,7 +904,7 @@ mod tests {
             unimplemented!()
         }
 
-        fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![]
         }
 
@@ -870,6 +949,13 @@ mod tests {
 
     impl ExecutionPlan for RenamedEmptyExec {
         fn name(&self) -> &'static str {
+            Self::static_name()
+        }
+
+        fn static_name() -> &'static str
+        where
+            Self: Sized,
+        {
             "MyRenamedEmptyExec"
         }
 
@@ -881,7 +967,7 @@ mod tests {
             unimplemented!()
         }
 
-        fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![]
         }
 
@@ -914,6 +1000,15 @@ mod tests {
         let schema2 = Arc::new(Schema::empty());
         let renamed_exec = RenamedEmptyExec::new(schema2);
         assert_eq!(renamed_exec.name(), "MyRenamedEmptyExec");
+        assert_eq!(RenamedEmptyExec::static_name(), "MyRenamedEmptyExec");
+    }
+
+    /// A compilation test to ensure that the `ExecutionPlan::name()` method can
+    /// be called from a trait object.
+    /// Related ticket: https://github.com/apache/datafusion/pull/11047
+    #[allow(dead_code)]
+    fn use_execution_plan_as_trait_object(plan: &dyn ExecutionPlan) {
+        let _ = plan.name();
     }
 }
 

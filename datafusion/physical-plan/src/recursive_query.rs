@@ -120,8 +120,8 @@ impl ExecutionPlan for RecursiveQueryExec {
         &self.cache
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![self.static_term.clone(), self.recursive_term.clone()]
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.static_term, &self.recursive_term]
     }
 
     // TODO: control these hints and see whether we can
@@ -325,7 +325,7 @@ fn assign_work_table(
     work_table: Arc<WorkTable>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let mut work_table_refs = 0;
-    plan.transform_down_mut(&mut |plan| {
+    plan.transform_down(|plan| {
         if let Some(exec) = plan.as_any().downcast_ref::<WorkTableExec>() {
             if work_table_refs > 0 {
                 not_impl_err!(
@@ -353,12 +353,14 @@ fn assign_work_table(
 /// However, if the data of the left table is derived from the work table, it will become outdated
 /// as the work table changes. When the next iteration executes this plan again, we must clear the left table.
 fn reset_plan_states(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
-    plan.transform_up(&|plan| {
+    plan.transform_up(|plan| {
         // WorkTableExec's states have already been updated correctly.
         if plan.as_any().is::<WorkTableExec>() {
             Ok(Transformed::no(plan))
         } else {
-            let new_plan = plan.clone().with_new_children(plan.children())?;
+            let new_plan = plan
+                .clone()
+                .with_new_children(plan.children().into_iter().cloned().collect())?;
             Ok(Transformed::yes(new_plan))
         }
     })

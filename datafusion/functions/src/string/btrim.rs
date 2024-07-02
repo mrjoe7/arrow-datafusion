@@ -21,6 +21,7 @@ use std::any::Any;
 use arrow::datatypes::DataType;
 
 use datafusion_common::{exec_err, Result};
+use datafusion_expr::function::Hint;
 use datafusion_expr::TypeSignature::*;
 use datafusion_expr::{ColumnarValue, Volatility};
 use datafusion_expr::{ScalarUDFImpl, Signature};
@@ -38,6 +39,12 @@ fn btrim<T: OffsetSizeTrait>(args: &[ArrayRef]) -> Result<ArrayRef> {
 pub struct BTrimFunc {
     signature: Signature,
     aliases: Vec<String>,
+}
+
+impl Default for BTrimFunc {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BTrimFunc {
@@ -72,8 +79,14 @@ impl ScalarUDFImpl for BTrimFunc {
 
     fn invoke(&self, args: &[ColumnarValue]) -> Result<ColumnarValue> {
         match args[0].data_type() {
-            DataType::Utf8 => make_scalar_function(btrim::<i32>, vec![])(args),
-            DataType::LargeUtf8 => make_scalar_function(btrim::<i64>, vec![])(args),
+            DataType::Utf8 => make_scalar_function(
+                btrim::<i32>,
+                vec![Hint::Pad, Hint::AcceptsSingular],
+            )(args),
+            DataType::LargeUtf8 => make_scalar_function(
+                btrim::<i64>,
+                vec![Hint::Pad, Hint::AcceptsSingular],
+            )(args),
             other => exec_err!("Unsupported data type {other:?} for function btrim"),
         }
     }

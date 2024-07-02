@@ -17,23 +17,23 @@
 #![warn(missing_docs, clippy::needless_borrow)]
 
 //! [DataFusion] is an extensible query engine written in Rust that
-//! uses [Apache Arrow] as its in-memory format. DataFusion's many [use
-//! cases] help developers build very fast and feature rich database
-//! and analytic systems, customized to particular workloads.
+//! uses [Apache Arrow] as its in-memory format. DataFusion help developers
+//! build fast and feature rich database and analytic systems, customized to
+//! particular workloads. See [use cases] for examples
 //!
 //! "Out of the box," DataFusion quickly runs complex [SQL] and
-//! [`DataFrame`] queries using a sophisticated query planner, a columnar,
-//! multi-threaded, vectorized execution engine, and partitioned data
+//! [`DataFrame`] queries using a full-featured query planner, a columnar,
+//! streaming, multi-threaded, vectorized execution engine, and partitioned data
 //! sources (Parquet, CSV, JSON, and Avro).
 //!
-//! DataFusion is designed for easy customization such as supporting
+//! DataFusion is designed for easy customization such as
 //! additional data sources, query languages, functions, custom
 //! operators and more. See the [Architecture] section for more details.
 //!
-//! [DataFusion]: https://arrow.apache.org/datafusion/
+//! [DataFusion]: https://datafusion.apache.org/
 //! [Apache Arrow]: https://arrow.apache.org
-//! [use cases]: https://arrow.apache.org/datafusion/user-guide/introduction.html#use-cases
-//! [SQL]: https://arrow.apache.org/datafusion/user-guide/sql/index.html
+//! [use cases]: https://datafusion.apache.org/user-guide/introduction.html#use-cases
+//! [SQL]: https://datafusion.apache.org/user-guide/sql/index.html
 //! [`DataFrame`]: dataframe::DataFrame
 //! [Architecture]: #architecture
 //!
@@ -128,13 +128,53 @@
 //!
 //! There are many additional annotated examples of using DataFusion in the [datafusion-examples] directory.
 //!
-//! [datafusion-examples]: https://github.com/apache/arrow-datafusion/tree/main/datafusion-examples
+//! [datafusion-examples]: https://github.com/apache/datafusion/tree/main/datafusion-examples
+//!
+//! # Architecture
+//!
+//! <!-- NOTE: The goal of this section is to provide a high level
+//! overview of how DataFusion is organized and then link to other
+//! sections of the docs with more details -->
+//!
+//! You can find a formal description of DataFusion's architecture in our
+//! [SIGMOD 2024 Paper].
+//!
+//! [SIGMOD 2024 Paper]: https://dl.acm.org/doi/10.1145/3626246.3653368
+//!
+//! ## Design Goals
+//! DataFusion's Architecture Goals are:
+//!
+//! 1. Work “out of the box”: Provide a very fast, world class query engine with
+//! minimal setup or required configuration.
+//!
+//! 2. Customizable everything: All behavior should be customizable by
+//! implementing traits.
+//!
+//! 3. Architecturally boring 🥱: Follow industrial best practice rather than
+//! trying cutting edge, but unproven, techniques.
+//!
+//! With these principles, users start with a basic, high-performance engine
+//! and specialize it over time to suit their needs and available engineering
+//! capacity.
+//!
+//! ## Overview  Presentations
+//!
+//! The following presentations offer high level overviews of the
+//! different components and how they interact together.
+//!
+//! - [Apr 2023]: The Apache DataFusion Architecture talks
+//!   - _Query Engine_: [recording](https://youtu.be/NVKujPxwSBA) and [slides](https://docs.google.com/presentation/d/1D3GDVas-8y0sA4c8EOgdCvEjVND4s2E7I6zfs67Y4j8/edit#slide=id.p)
+//!   - _Logical Plan and Expressions_: [recording](https://youtu.be/EzZTLiSJnhY) and [slides](https://docs.google.com/presentation/d/1ypylM3-w60kVDW7Q6S99AHzvlBgciTdjsAfqNP85K30)
+//!   - _Physical Plan and Execution_: [recording](https://youtu.be/2jkWU3_w6z0) and [slides](https://docs.google.com/presentation/d/1cA2WQJ2qg6tx6y4Wf8FH2WVSm9JQ5UgmBWATHdik0hg)
+//! - [July 2022]: DataFusion and Arrow: Supercharge Your Data Analytical Tool with a Rusty Query Engine: [recording](https://www.youtube.com/watch?v=Rii1VTn3seQ) and [slides](https://docs.google.com/presentation/d/1q1bPibvu64k2b7LPi7Yyb0k3gA1BiUYiUbEklqW1Ckc/view#slide=id.g11054eeab4c_0_1165)
+//! - [March 2021]: The DataFusion architecture is described in _Query Engine Design and the Rust-Based DataFusion in Apache Arrow_: [recording](https://www.youtube.com/watch?v=K6eCAVEk4kU) (DataFusion content starts [~ 15 minutes in](https://www.youtube.com/watch?v=K6eCAVEk4kU&t=875s)) and [slides](https://www.slideshare.net/influxdata/influxdb-iox-tech-talks-query-engine-design-and-the-rustbased-datafusion-in-apache-arrow-244161934)
+//! - [February 2021]: How DataFusion is used within the Ballista Project is described in _Ballista: Distributed Compute with Rust and Apache Arrow_: [recording](https://www.youtube.com/watch?v=ZZHQaOap9pQ)
 //!
 //! ## Customization and Extension
 //!
-//! DataFusion is a "disaggregated" query engine. This
-//! means developers can start with a working, full featured engine, and then
-//! extend the areas they need to specialize for their usecase. For example,
+//! DataFusion is designed to be highly extensible, so you can
+//! start with a working, full featured engine, and then
+//! specialize any behavior for their usecase. For example,
 //! some projects may add custom [`ExecutionPlan`] operators, or create their own
 //! query language that directly creates [`LogicalPlan`] rather than using the
 //! built in SQL planner, [`SqlToRel`].
@@ -160,30 +200,6 @@
 //! [`OptimizerRule`]: datafusion_optimizer::optimizer::OptimizerRule
 //! [`AnalyzerRule`]:  datafusion_optimizer::analyzer::AnalyzerRule
 //! [`PhysicalOptimizerRule`]: crate::physical_optimizer::optimizer::PhysicalOptimizerRule
-//!
-//! # Architecture
-//!
-//! <!-- NOTE: The goal of this section is to provide a high level
-//! overview of how DataFusion is organized and then link to other
-//! sections of the docs with more details -->
-//!
-//! You can find a formal description of DataFusion's architecture in our
-//! [SIGMOD 2024 Paper].
-//!
-//! [SIGMOD 2024 Paper]: https://github.com/apache/arrow-datafusion/files/14789704/DataFusion_Query_Engine___SIGMOD_2024-FINAL.pdf
-//!
-//! ## Overview  Presentations
-//!
-//! The following presentations offer high level overviews of the
-//! different components and how they interact together.
-//!
-//! - [Apr 2023]: The Apache Arrow DataFusion Architecture talks
-//!   - _Query Engine_: [recording](https://youtu.be/NVKujPxwSBA) and [slides](https://docs.google.com/presentation/d/1D3GDVas-8y0sA4c8EOgdCvEjVND4s2E7I6zfs67Y4j8/edit#slide=id.p)
-//!   - _Logical Plan and Expressions_: [recording](https://youtu.be/EzZTLiSJnhY) and [slides](https://docs.google.com/presentation/d/1ypylM3-w60kVDW7Q6S99AHzvlBgciTdjsAfqNP85K30)
-//!   - _Physical Plan and Execution_: [recording](https://youtu.be/2jkWU3_w6z0) and [slides](https://docs.google.com/presentation/d/1cA2WQJ2qg6tx6y4Wf8FH2WVSm9JQ5UgmBWATHdik0hg)
-//! - [July 2022]: DataFusion and Arrow: Supercharge Your Data Analytical Tool with a Rusty Query Engine: [recording](https://www.youtube.com/watch?v=Rii1VTn3seQ) and [slides](https://docs.google.com/presentation/d/1q1bPibvu64k2b7LPi7Yyb0k3gA1BiUYiUbEklqW1Ckc/view#slide=id.g11054eeab4c_0_1165)
-//! - [March 2021]: The DataFusion architecture is described in _Query Engine Design and the Rust-Based DataFusion in Apache Arrow_: [recording](https://www.youtube.com/watch?v=K6eCAVEk4kU) (DataFusion content starts [~ 15 minutes in](https://www.youtube.com/watch?v=K6eCAVEk4kU&t=875s)) and [slides](https://www.slideshare.net/influxdata/influxdb-iox-tech-talks-query-engine-design-and-the-rustbased-datafusion-in-apache-arrow-244161934)
-//! - [February 2021]: How DataFusion is used within the Ballista Project is described in _Ballista: Distributed Compute with Rust and Apache Arrow_: [recording](https://www.youtube.com/watch?v=ZZHQaOap9pQ)
 //!
 //! ## Query Planning and Execution Overview
 //!
@@ -296,13 +312,17 @@
 //! A [`LogicalPlan`] is a Directed Acyclic Graph (DAG) of other
 //! [`LogicalPlan`]s, each potentially containing embedded [`Expr`]s.
 //!
-//! [`Expr`]s can be rewritten using the  [`TreeNode`] API and simplified using
-//! [`ExprSimplifier`]. Examples of working with and executing `Expr`s can be found in the
-//! [`expr_api`.rs] example
+//! `LogicalPlan`s can be rewritten with [`TreeNode`] API, see the
+//! [`tree_node module`] for more details.
+//!
+//! [`Expr`]s can also be rewritten with [`TreeNode`] API and simplified using
+//! [`ExprSimplifier`]. Examples of working with and executing `Expr`s can be
+//! found in the [`expr_api`.rs] example
 //!
 //! [`TreeNode`]: datafusion_common::tree_node::TreeNode
+//! [`tree_node module`]: datafusion_expr::logical_plan::tree_node
 //! [`ExprSimplifier`]: crate::optimizer::simplify_expressions::ExprSimplifier
-//! [`expr_api`.rs]: https://github.com/apache/arrow-datafusion/blob/main/datafusion-examples/examples/expr_api.rs
+//! [`expr_api`.rs]: https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/expr_api.rs
 //!
 //! ### Physical Plans
 //!
@@ -375,7 +395,7 @@
 //! [`RepartitionExec`]: https://docs.rs/datafusion/latest/datafusion/physical_plan/repartition/struct.RepartitionExec.html
 //! [Volcano style]: https://w6113.github.io/files/papers/volcanoparallelism-89.pdf
 //! [Morsel-Driven Parallelism]: https://db.in.tum.de/~leis/papers/morsels.pdf
-//! [DataFusion paper submitted SIGMOD]: https://github.com/apache/arrow-datafusion/files/13874720/DataFusion_Query_Engine___SIGMOD_2024.pdf
+//! [DataFusion paper submitted SIGMOD]: https://github.com/apache/datafusion/files/13874720/DataFusion_Query_Engine___SIGMOD_2024.pdf
 //! [implementors of `ExecutionPlan`]: https://docs.rs/datafusion/latest/datafusion/physical_plan/trait.ExecutionPlan.html#implementors
 //!
 //! ## Thread Scheduling
@@ -435,11 +455,28 @@
 //! and improve compilation times. The crates are:
 //!
 //! * [datafusion_common]: Common traits and types
-//! * [datafusion_expr]: [`LogicalPlan`],  [`Expr`] and related logical planning structure
 //! * [datafusion_execution]: State and structures needed for execution
+//! * [datafusion_expr]: [`LogicalPlan`],  [`Expr`] and related logical planning structure
+//! * [datafusion_functions]: Scalar function packages
+//! * [datafusion_functions_array]: Scalar function packages for `ARRAY`s
 //! * [datafusion_optimizer]: [`OptimizerRule`]s and [`AnalyzerRule`]s
 //! * [datafusion_physical_expr]: [`PhysicalExpr`] and related expressions
+//! * [datafusion_physical_plan]: [`ExecutionPlan`] and related expressions
 //! * [datafusion_sql]: SQL planner ([`SqlToRel`])
+//!
+//! ## Citing DataFusion in Academic Papers
+//!
+//! You can use the following citation to reference DataFusion in academic papers:
+//!
+//! ```text
+//! @inproceedings{lamb2024apache
+//!   title={Apache Arrow DataFusion: A Fast, Embeddable, Modular Analytic Query Engine},
+//!   author={Lamb, Andrew and Shen, Yijie and Heres, Dani{\"e}l and Chakraborty, Jayjeet and Kabak, Mehmet Ozan and Hsieh, Liang-Chi and Sun, Chao},
+//!   booktitle={Companion of the 2024 International Conference on Management of Data},
+//!   pages={5--17},
+//!   year={2024}
+//! }
+//! ```
 //!
 //! [sqlparser]: https://docs.rs/sqlparser/latest/sqlparser
 //! [`SqlToRel`]: sql::planner::SqlToRel
@@ -481,7 +518,7 @@ pub use parquet;
 
 // re-export DataFusion sub-crates at the top level. Use `pub use *`
 // so that the contents of the subcrates appears in rustdocs
-// for details, see https://github.com/apache/arrow-datafusion/issues/6648
+// for details, see https://github.com/apache/datafusion/issues/6648
 
 /// re-export of [`datafusion_common`] crate
 pub mod common {
@@ -536,6 +573,11 @@ pub mod functions {
 pub mod functions_array {
     #[cfg(feature = "array_expressions")]
     pub use datafusion_functions_array::*;
+}
+
+/// re-export of [`datafusion_functions_aggregate`] crate
+pub mod functions_aggregate {
+    pub use datafusion_functions_aggregate::*;
 }
 
 #[cfg(test)]

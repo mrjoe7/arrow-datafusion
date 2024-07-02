@@ -29,14 +29,14 @@ use crate::aggregates::{
 };
 use crate::common::IPCWriter;
 use crate::metrics::{BaselineMetrics, RecordOutput};
-use crate::sorts::sort::{read_spill_as_stream, sort_batch};
+use crate::sorts::sort::sort_batch;
 use crate::sorts::streaming_merge;
 use crate::stream::RecordBatchStreamAdapter;
-use crate::{aggregates, ExecutionPlan, PhysicalExpr};
+use crate::{aggregates, read_spill_as_stream, ExecutionPlan, PhysicalExpr};
 use crate::{RecordBatchStream, SendableRecordBatchStream};
 
 use arrow::array::*;
-use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
+use arrow::datatypes::SchemaRef;
 use arrow_schema::SortOptions;
 use datafusion_common::{DataFusionError, Result};
 use datafusion_execution::disk_manager::RefCountedTempFile;
@@ -752,7 +752,7 @@ impl GroupedHashAggregateStream {
             })),
         )));
         for spill in self.spill_state.spills.drain(..) {
-            let stream = read_spill_as_stream(spill, schema.clone())?;
+            let stream = read_spill_as_stream(spill, schema.clone(), 2)?;
             streams.push(stream);
         }
         self.spill_state.is_stream_merging = true;

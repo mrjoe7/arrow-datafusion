@@ -18,17 +18,18 @@
 //! [`ScalarValue`]: stores single  values
 
 mod struct_builder;
-
 use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::{HashSet, VecDeque};
-use std::convert::{Infallible, TryFrom, TryInto};
+use std::convert::Infallible;
 use std::fmt;
 use std::hash::Hash;
+use std::hash::Hasher;
 use std::iter::repeat;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use crate::arrow_datafusion_err;
 use crate::cast::{
     as_decimal128_array, as_decimal256_array, as_dictionary_array,
     as_fixed_size_binary_array, as_fixed_size_list_array,
@@ -45,17 +46,17 @@ use arrow::{
     compute::kernels::cast::{cast_with_options, CastOptions},
     datatypes::{
         i256, ArrowDictionaryKeyType, ArrowNativeType, ArrowTimestampType, DataType,
-        Date32Type, Field, Float32Type, Int16Type, Int32Type, Int64Type, Int8Type,
-        IntervalDayTimeType, IntervalMonthDayNanoType, IntervalUnit,
+        Date32Type, Date64Type, Field, Float32Type, Int16Type, Int32Type, Int64Type,
+        Int8Type, IntervalDayTimeType, IntervalMonthDayNanoType, IntervalUnit,
         IntervalYearMonthType, TimeUnit, TimestampMicrosecondType,
         TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType,
         UInt16Type, UInt32Type, UInt64Type, UInt8Type, DECIMAL128_MAX_PRECISION,
     },
 };
-use arrow_array::{ArrowNativeTypeOp, Scalar};
-use arrow_buffer::Buffer;
+use arrow_buffer::{IntervalDayTime, IntervalMonthDayNano, ScalarBuffer};
 use arrow_schema::{UnionFields, UnionMode};
 
+use half::f16;
 pub use struct_builder::ScalarStructBuilder;
 
 /// A dynamically typed, nullable single value.
@@ -193,6 +194,8 @@ pub enum ScalarValue {
     Null,
     /// true or false value
     Boolean(Option<bool>),
+    /// 16bit float
+    Float16(Option<f16>),
     /// 32bit float
     Float32(Option<f32>),
     /// 64bit float
@@ -219,10 +222,14 @@ pub enum ScalarValue {
     UInt64(Option<u64>),
     /// utf-8 encoded string.
     Utf8(Option<String>),
+    /// utf-8 encoded string but from view types.
+    Utf8View(Option<String>),
     /// utf-8 encoded string representing a LargeString's arrow type.
     LargeUtf8(Option<String>),
     /// binary
     Binary(Option<Vec<u8>>),
+    /// binary but from view types.
+    BinaryView(Option<Vec<u8>>),
     /// fixed size binary
     FixedSizeBinary(i32, Option<Vec<u8>>),
     /// large binary
@@ -264,11 +271,11 @@ pub enum ScalarValue {
     IntervalYearMonth(Option<i32>),
     /// Number of elapsed days and milliseconds (no leap seconds)
     /// stored as 2 contiguous 32-bit signed integers
-    IntervalDayTime(Option<i64>),
+    IntervalDayTime(Option<IntervalDayTime>),
     /// A triple of the number of elapsed months, days, and nanoseconds.
     /// Months and days are encoded as 32-bit signed integers.
     /// Nanoseconds is encoded as a 64-bit signed integer (no leap seconds).
-    IntervalMonthDayNano(Option<i128>),
+    IntervalMonthDayNano(Option<IntervalMonthDayNano>),
     /// Duration in seconds
     DurationSecond(Option<i64>),
     /// Duration in milliseconds
@@ -284,6 +291,12 @@ pub enum ScalarValue {
     Union(Option<(i8, Box<ScalarValue>)>, UnionFields, UnionMode),
     /// Dictionary type: index type and value
     Dictionary(Box<DataType>, Box<ScalarValue>),
+}
+
+impl Hash for Fl<f16> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.to_bits().hash(state);
+    }
 }
 
 // manual implementation of `PartialEq`
@@ -308,7 +321,12 @@ impl PartialEq for ScalarValue {
                 (Some(f1), Some(f2)) => f1.to_bits() == f2.to_bits(),
                 _ => v1.eq(v2),
             },
+            (Float16(v1), Float16(v2)) => match (v1, v2) {
+                (Some(f1), Some(f2)) => f1.to_bits() == f2.to_bits(),
+                _ => v1.eq(v2),
+            },
             (Float32(_), _) => false,
+            (Float16(_), _) => false,
             (Float64(v1), Float64(v2)) => match (v1, v2) {
                 (Some(f1), Some(f2)) => f1.to_bits() == f2.to_bits(),
                 _ => v1.eq(v2),
@@ -332,10 +350,14 @@ impl PartialEq for ScalarValue {
             (UInt64(_), _) => false,
             (Utf8(v1), Utf8(v2)) => v1.eq(v2),
             (Utf8(_), _) => false,
+            (Utf8View(v1), Utf8View(v2)) => v1.eq(v2),
+            (Utf8View(_), _) => false,
             (LargeUtf8(v1), LargeUtf8(v2)) => v1.eq(v2),
             (LargeUtf8(_), _) => false,
             (Binary(v1), Binary(v2)) => v1.eq(v2),
             (Binary(_), _) => false,
+            (BinaryView(v1), BinaryView(v2)) => v1.eq(v2),
+            (BinaryView(_), _) => false,
             (FixedSizeBinary(_, v1), FixedSizeBinary(_, v2)) => v1.eq(v2),
             (FixedSizeBinary(_, _), _) => false,
             (LargeBinary(v1), LargeBinary(v2)) => v1.eq(v2),
@@ -426,7 +448,12 @@ impl PartialOrd for ScalarValue {
                 (Some(f1), Some(f2)) => Some(f1.total_cmp(f2)),
                 _ => v1.partial_cmp(v2),
             },
+            (Float16(v1), Float16(v2)) => match (v1, v2) {
+                (Some(f1), Some(f2)) => Some(f1.total_cmp(f2)),
+                _ => v1.partial_cmp(v2),
+            },
             (Float32(_), _) => None,
+            (Float16(_), _) => None,
             (Float64(v1), Float64(v2)) => match (v1, v2) {
                 (Some(f1), Some(f2)) => Some(f1.total_cmp(f2)),
                 _ => v1.partial_cmp(v2),
@@ -452,8 +479,12 @@ impl PartialOrd for ScalarValue {
             (Utf8(_), _) => None,
             (LargeUtf8(v1), LargeUtf8(v2)) => v1.partial_cmp(v2),
             (LargeUtf8(_), _) => None,
+            (Utf8View(v1), Utf8View(v2)) => v1.partial_cmp(v2),
+            (Utf8View(_), _) => None,
             (Binary(v1), Binary(v2)) => v1.partial_cmp(v2),
             (Binary(_), _) => None,
+            (BinaryView(v1), BinaryView(v2)) => v1.partial_cmp(v2),
+            (BinaryView(_), _) => None,
             (FixedSizeBinary(_, v1), FixedSizeBinary(_, v2)) => v1.partial_cmp(v2),
             (FixedSizeBinary(_, _), _) => None,
             (LargeBinary(v1), LargeBinary(v2)) => v1.partial_cmp(v2),
@@ -638,6 +669,7 @@ impl std::hash::Hash for ScalarValue {
                 s.hash(state)
             }
             Boolean(v) => v.hash(state),
+            Float16(v) => v.map(Fl).hash(state),
             Float32(v) => v.map(Fl).hash(state),
             Float64(v) => v.map(Fl).hash(state),
             Int8(v) => v.hash(state),
@@ -648,11 +680,10 @@ impl std::hash::Hash for ScalarValue {
             UInt16(v) => v.hash(state),
             UInt32(v) => v.hash(state),
             UInt64(v) => v.hash(state),
-            Utf8(v) => v.hash(state),
-            LargeUtf8(v) => v.hash(state),
-            Binary(v) => v.hash(state),
-            FixedSizeBinary(_, v) => v.hash(state),
-            LargeBinary(v) => v.hash(state),
+            Utf8(v) | LargeUtf8(v) | Utf8View(v) => v.hash(state),
+            Binary(v) | FixedSizeBinary(_, v) | LargeBinary(v) | BinaryView(v) => {
+                v.hash(state)
+            }
             List(arr) => {
                 hash_nested_array(arr.to_owned() as ArrayRef, state);
             }
@@ -951,6 +982,7 @@ impl ScalarValue {
             DataType::UInt16 => ScalarValue::UInt16(Some(0)),
             DataType::UInt32 => ScalarValue::UInt32(Some(0)),
             DataType::UInt64 => ScalarValue::UInt64(Some(0)),
+            DataType::Float16 => ScalarValue::Float16(Some(f16::from_f32(0.0))),
             DataType::Float32 => ScalarValue::Float32(Some(0.0)),
             DataType::Float64 => ScalarValue::Float64(Some(0.0)),
             DataType::Timestamp(TimeUnit::Second, tz) => {
@@ -969,10 +1001,10 @@ impl ScalarValue {
                 ScalarValue::IntervalYearMonth(Some(0))
             }
             DataType::Interval(IntervalUnit::DayTime) => {
-                ScalarValue::IntervalDayTime(Some(0))
+                ScalarValue::IntervalDayTime(Some(IntervalDayTime::ZERO))
             }
             DataType::Interval(IntervalUnit::MonthDayNano) => {
-                ScalarValue::IntervalMonthDayNano(Some(0))
+                ScalarValue::IntervalMonthDayNano(Some(IntervalMonthDayNano::ZERO))
             }
             DataType::Duration(TimeUnit::Second) => ScalarValue::DurationSecond(Some(0)),
             DataType::Duration(TimeUnit::Millisecond) => {
@@ -1004,6 +1036,7 @@ impl ScalarValue {
             DataType::UInt16 => ScalarValue::UInt16(Some(1)),
             DataType::UInt32 => ScalarValue::UInt32(Some(1)),
             DataType::UInt64 => ScalarValue::UInt64(Some(1)),
+            DataType::Float16 => ScalarValue::Float16(Some(f16::from_f32(1.0))),
             DataType::Float32 => ScalarValue::Float32(Some(1.0)),
             DataType::Float64 => ScalarValue::Float64(Some(1.0)),
             _ => {
@@ -1022,6 +1055,7 @@ impl ScalarValue {
             DataType::Int16 | DataType::UInt16 => ScalarValue::Int16(Some(-1)),
             DataType::Int32 | DataType::UInt32 => ScalarValue::Int32(Some(-1)),
             DataType::Int64 | DataType::UInt64 => ScalarValue::Int64(Some(-1)),
+            DataType::Float16 => ScalarValue::Float16(Some(f16::from_f32(-1.0))),
             DataType::Float32 => ScalarValue::Float32(Some(-1.0)),
             DataType::Float64 => ScalarValue::Float64(Some(-1.0)),
             _ => {
@@ -1043,11 +1077,12 @@ impl ScalarValue {
             DataType::UInt16 => ScalarValue::UInt16(Some(10)),
             DataType::UInt32 => ScalarValue::UInt32(Some(10)),
             DataType::UInt64 => ScalarValue::UInt64(Some(10)),
+            DataType::Float16 => ScalarValue::Float16(Some(f16::from_f32(10.0))),
             DataType::Float32 => ScalarValue::Float32(Some(10.0)),
             DataType::Float64 => ScalarValue::Float64(Some(10.0)),
             _ => {
                 return _not_impl_err!(
-                    "Can't create a negative one scalar from data_type \"{datatype:?}\""
+                    "Can't create a ten scalar from data_type \"{datatype:?}\""
                 );
             }
         })
@@ -1083,11 +1118,14 @@ impl ScalarValue {
             ScalarValue::TimestampNanosecond(_, tz_opt) => {
                 DataType::Timestamp(TimeUnit::Nanosecond, tz_opt.clone())
             }
+            ScalarValue::Float16(_) => DataType::Float16,
             ScalarValue::Float32(_) => DataType::Float32,
             ScalarValue::Float64(_) => DataType::Float64,
             ScalarValue::Utf8(_) => DataType::Utf8,
             ScalarValue::LargeUtf8(_) => DataType::LargeUtf8,
+            ScalarValue::Utf8View(_) => DataType::Utf8View,
             ScalarValue::Binary(_) => DataType::Binary,
+            ScalarValue::BinaryView(_) => DataType::BinaryView,
             ScalarValue::FixedSizeBinary(sz, _) => DataType::FixedSizeBinary(*sz),
             ScalarValue::LargeBinary(_) => DataType::LargeBinary,
             ScalarValue::List(arr) => arr.data_type().to_owned(),
@@ -1135,49 +1173,111 @@ impl ScalarValue {
 
     /// Calculate arithmetic negation for a scalar value
     pub fn arithmetic_negate(&self) -> Result<Self> {
+        fn neg_checked_with_ctx<T: ArrowNativeTypeOp>(
+            v: T,
+            ctx: impl Fn() -> String,
+        ) -> Result<T> {
+            v.neg_checked()
+                .map_err(|e| arrow_datafusion_err!(e).context(ctx()))
+        }
         match self {
             ScalarValue::Int8(None)
             | ScalarValue::Int16(None)
             | ScalarValue::Int32(None)
             | ScalarValue::Int64(None)
+            | ScalarValue::Float16(None)
             | ScalarValue::Float32(None)
             | ScalarValue::Float64(None) => Ok(self.clone()),
+            ScalarValue::Float16(Some(v)) => {
+                Ok(ScalarValue::Float16(Some(f16::from_f32(-v.to_f32()))))
+            }
             ScalarValue::Float64(Some(v)) => Ok(ScalarValue::Float64(Some(-v))),
             ScalarValue::Float32(Some(v)) => Ok(ScalarValue::Float32(Some(-v))),
-            ScalarValue::Int8(Some(v)) => Ok(ScalarValue::Int8(Some(-v))),
-            ScalarValue::Int16(Some(v)) => Ok(ScalarValue::Int16(Some(-v))),
-            ScalarValue::Int32(Some(v)) => Ok(ScalarValue::Int32(Some(-v))),
-            ScalarValue::Int64(Some(v)) => Ok(ScalarValue::Int64(Some(-v))),
-            ScalarValue::IntervalYearMonth(Some(v)) => {
-                Ok(ScalarValue::IntervalYearMonth(Some(-v)))
-            }
+            ScalarValue::Int8(Some(v)) => Ok(ScalarValue::Int8(Some(v.neg_checked()?))),
+            ScalarValue::Int16(Some(v)) => Ok(ScalarValue::Int16(Some(v.neg_checked()?))),
+            ScalarValue::Int32(Some(v)) => Ok(ScalarValue::Int32(Some(v.neg_checked()?))),
+            ScalarValue::Int64(Some(v)) => Ok(ScalarValue::Int64(Some(v.neg_checked()?))),
+            ScalarValue::IntervalYearMonth(Some(v)) => Ok(
+                ScalarValue::IntervalYearMonth(Some(neg_checked_with_ctx(*v, || {
+                    format!("In negation of IntervalYearMonth({v})")
+                })?)),
+            ),
             ScalarValue::IntervalDayTime(Some(v)) => {
                 let (days, ms) = IntervalDayTimeType::to_parts(*v);
-                let val = IntervalDayTimeType::make_value(-days, -ms);
+                let val = IntervalDayTimeType::make_value(
+                    neg_checked_with_ctx(days, || {
+                        format!("In negation of days {days} in IntervalDayTime")
+                    })?,
+                    neg_checked_with_ctx(ms, || {
+                        format!("In negation of milliseconds {ms} in IntervalDayTime")
+                    })?,
+                );
                 Ok(ScalarValue::IntervalDayTime(Some(val)))
             }
             ScalarValue::IntervalMonthDayNano(Some(v)) => {
                 let (months, days, nanos) = IntervalMonthDayNanoType::to_parts(*v);
-                let val = IntervalMonthDayNanoType::make_value(-months, -days, -nanos);
+                let val = IntervalMonthDayNanoType::make_value(
+                    neg_checked_with_ctx(months, || {
+                        format!("In negation of months {months} of IntervalMonthDayNano")
+                    })?,
+                    neg_checked_with_ctx(days, || {
+                        format!("In negation of days {days} of IntervalMonthDayNano")
+                    })?,
+                    neg_checked_with_ctx(nanos, || {
+                        format!("In negation of nanos {nanos} of IntervalMonthDayNano")
+                    })?,
+                );
                 Ok(ScalarValue::IntervalMonthDayNano(Some(val)))
             }
             ScalarValue::Decimal128(Some(v), precision, scale) => {
-                Ok(ScalarValue::Decimal128(Some(-v), *precision, *scale))
+                Ok(ScalarValue::Decimal128(
+                    Some(neg_checked_with_ctx(*v, || {
+                        format!("In negation of Decimal128({v}, {precision}, {scale})")
+                    })?),
+                    *precision,
+                    *scale,
+                ))
             }
-            ScalarValue::Decimal256(Some(v), precision, scale) => Ok(
-                ScalarValue::Decimal256(Some(v.neg_wrapping()), *precision, *scale),
-            ),
+            ScalarValue::Decimal256(Some(v), precision, scale) => {
+                Ok(ScalarValue::Decimal256(
+                    Some(neg_checked_with_ctx(*v, || {
+                        format!("In negation of Decimal256({v}, {precision}, {scale})")
+                    })?),
+                    *precision,
+                    *scale,
+                ))
+            }
             ScalarValue::TimestampSecond(Some(v), tz) => {
-                Ok(ScalarValue::TimestampSecond(Some(-v), tz.clone()))
+                Ok(ScalarValue::TimestampSecond(
+                    Some(neg_checked_with_ctx(*v, || {
+                        format!("In negation of TimestampSecond({v})")
+                    })?),
+                    tz.clone(),
+                ))
             }
             ScalarValue::TimestampNanosecond(Some(v), tz) => {
-                Ok(ScalarValue::TimestampNanosecond(Some(-v), tz.clone()))
+                Ok(ScalarValue::TimestampNanosecond(
+                    Some(neg_checked_with_ctx(*v, || {
+                        format!("In negation of TimestampNanoSecond({v})")
+                    })?),
+                    tz.clone(),
+                ))
             }
             ScalarValue::TimestampMicrosecond(Some(v), tz) => {
-                Ok(ScalarValue::TimestampMicrosecond(Some(-v), tz.clone()))
+                Ok(ScalarValue::TimestampMicrosecond(
+                    Some(neg_checked_with_ctx(*v, || {
+                        format!("In negation of TimestampMicroSecond({v})")
+                    })?),
+                    tz.clone(),
+                ))
             }
             ScalarValue::TimestampMillisecond(Some(v), tz) => {
-                Ok(ScalarValue::TimestampMillisecond(Some(-v), tz.clone()))
+                Ok(ScalarValue::TimestampMillisecond(
+                    Some(neg_checked_with_ctx(*v, || {
+                        format!("In negation of TimestampMilliSecond({v})")
+                    })?),
+                    tz.clone(),
+                ))
             }
             value => _internal_err!(
                 "Can not run arithmetic negative on scalar value {value:?}"
@@ -1277,6 +1377,7 @@ impl ScalarValue {
         match self {
             ScalarValue::Boolean(v) => v.is_none(),
             ScalarValue::Null => true,
+            ScalarValue::Float16(v) => v.is_none(),
             ScalarValue::Float32(v) => v.is_none(),
             ScalarValue::Float64(v) => v.is_none(),
             ScalarValue::Decimal128(v, _, _) => v.is_none(),
@@ -1289,11 +1390,13 @@ impl ScalarValue {
             ScalarValue::UInt16(v) => v.is_none(),
             ScalarValue::UInt32(v) => v.is_none(),
             ScalarValue::UInt64(v) => v.is_none(),
-            ScalarValue::Utf8(v) => v.is_none(),
-            ScalarValue::LargeUtf8(v) => v.is_none(),
-            ScalarValue::Binary(v) => v.is_none(),
-            ScalarValue::FixedSizeBinary(_, v) => v.is_none(),
-            ScalarValue::LargeBinary(v) => v.is_none(),
+            ScalarValue::Utf8(v)
+            | ScalarValue::Utf8View(v)
+            | ScalarValue::LargeUtf8(v) => v.is_none(),
+            ScalarValue::Binary(v)
+            | ScalarValue::BinaryView(v)
+            | ScalarValue::FixedSizeBinary(_, v)
+            | ScalarValue::LargeBinary(v) => v.is_none(),
             // arr.len() should be 1 for a list scalar, but we don't seem to
             // enforce that anywhere, so we still check against array length.
             ScalarValue::List(arr) => arr.len() == arr.null_count(),
@@ -1340,6 +1443,9 @@ impl ScalarValue {
             (Self::UInt32(Some(l)), Self::UInt32(Some(r))) => Some(l.abs_diff(*r) as _),
             (Self::UInt64(Some(l)), Self::UInt64(Some(r))) => Some(l.abs_diff(*r) as _),
             // TODO: we might want to look into supporting ceil/floor here for floats.
+            (Self::Float16(Some(l)), Self::Float16(Some(r))) => {
+                Some((f16::to_f32(*l) - f16::to_f32(*r)).abs().round() as _)
+            }
             (Self::Float32(Some(l)), Self::Float32(Some(r))) => {
                 Some((l - r).abs().round() as _)
             }
@@ -1523,6 +1629,7 @@ impl ScalarValue {
             }
             DataType::Null => ScalarValue::iter_to_null_array(scalars)?,
             DataType::Boolean => build_array_primitive!(BooleanArray, Boolean),
+            DataType::Float16 => build_array_primitive!(Float16Array, Float16),
             DataType::Float32 => build_array_primitive!(Float32Array, Float32),
             DataType::Float64 => build_array_primitive!(Float64Array, Float64),
             DataType::Int8 => build_array_primitive!(Int8Array, Int8),
@@ -1575,6 +1682,18 @@ impl ScalarValue {
                     tz
                 )
             }
+            DataType::Duration(TimeUnit::Second) => {
+                build_array_primitive!(DurationSecondArray, DurationSecond)
+            }
+            DataType::Duration(TimeUnit::Millisecond) => {
+                build_array_primitive!(DurationMillisecondArray, DurationMillisecond)
+            }
+            DataType::Duration(TimeUnit::Microsecond) => {
+                build_array_primitive!(DurationMicrosecondArray, DurationMicrosecond)
+            }
+            DataType::Duration(TimeUnit::Nanosecond) => {
+                build_array_primitive!(DurationNanosecondArray, DurationNanosecond)
+            }
             DataType::Interval(IntervalUnit::DayTime) => {
                 build_array_primitive!(IntervalDayTimeArray, IntervalDayTime)
             }
@@ -1605,7 +1724,10 @@ impl ScalarValue {
                 let arrays = arrays.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
                 arrow::compute::concat(arrays.as_slice())?
             }
-            DataType::List(_) | DataType::LargeList(_) | DataType::Struct(_) => {
+            DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::Struct(_)
+            | DataType::Union(_, _) => {
                 let arrays = scalars.map(|s| s.to_array()).collect::<Result<Vec<_>>>()?;
                 let arrays = arrays.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
                 arrow::compute::concat(arrays.as_slice())?
@@ -1668,13 +1790,10 @@ impl ScalarValue {
             // not supported if the TimeUnit is not valid (Time32 can
             // only be used with Second and Millisecond, Time64 only
             // with Microsecond and Nanosecond)
-            DataType::Float16
-            | DataType::Time32(TimeUnit::Microsecond)
+            DataType::Time32(TimeUnit::Microsecond)
             | DataType::Time32(TimeUnit::Nanosecond)
             | DataType::Time64(TimeUnit::Second)
             | DataType::Time64(TimeUnit::Millisecond)
-            | DataType::Duration(_)
-            | DataType::Union(_, _)
             | DataType::Map(_, _)
             | DataType::RunEndEncoded(_, _)
             | DataType::Utf8View
@@ -1688,7 +1807,6 @@ impl ScalarValue {
                 );
             }
         };
-
         Ok(array)
     }
 
@@ -1791,7 +1909,7 @@ impl ScalarValue {
     ///    ScalarValue::Int32(Some(2))
     /// ];
     ///
-    /// let result = ScalarValue::new_list(&scalars, &DataType::Int32);
+    /// let result = ScalarValue::new_list(&scalars, &DataType::Int32, true);
     ///
     /// let expected = ListArray::from_iter_primitive::<Int32Type, _, _>(
     ///     vec![
@@ -1800,13 +1918,25 @@ impl ScalarValue {
     ///
     /// assert_eq!(*result, expected);
     /// ```
-    pub fn new_list(values: &[ScalarValue], data_type: &DataType) -> Arc<ListArray> {
+    pub fn new_list(
+        values: &[ScalarValue],
+        data_type: &DataType,
+        nullable: bool,
+    ) -> Arc<ListArray> {
         let values = if values.is_empty() {
             new_empty_array(data_type)
         } else {
             Self::iter_to_array(values.iter().cloned()).unwrap()
         };
-        Arc::new(array_into_list_array(values))
+        Arc::new(array_into_list_array(values, nullable))
+    }
+
+    /// Same as [`ScalarValue::new_list`] but with nullable set to true.
+    pub fn new_list_nullable(
+        values: &[ScalarValue],
+        data_type: &DataType,
+    ) -> Arc<ListArray> {
+        Self::new_list(values, data_type, true)
     }
 
     /// Converts `IntoIterator<Item = ScalarValue>` where each element has type corresponding to
@@ -1825,7 +1955,7 @@ impl ScalarValue {
     ///    ScalarValue::Int32(Some(2))
     /// ];
     ///
-    /// let result = ScalarValue::new_list_from_iter(scalars.into_iter(), &DataType::Int32);
+    /// let result = ScalarValue::new_list_from_iter(scalars.into_iter(), &DataType::Int32, true);
     ///
     /// let expected = ListArray::from_iter_primitive::<Int32Type, _, _>(
     ///     vec![
@@ -1837,13 +1967,14 @@ impl ScalarValue {
     pub fn new_list_from_iter(
         values: impl IntoIterator<Item = ScalarValue> + ExactSizeIterator,
         data_type: &DataType,
+        nullable: bool,
     ) -> Arc<ListArray> {
         let values = if values.len() == 0 {
             new_empty_array(data_type)
         } else {
             Self::iter_to_array(values).unwrap()
         };
-        Arc::new(array_into_list_array(values))
+        Arc::new(array_into_list_array(values, nullable))
     }
 
     /// Converts `Vec<ScalarValue>` where each element has type corresponding to
@@ -1909,6 +2040,9 @@ impl ScalarValue {
             ScalarValue::Float32(e) => {
                 build_array_from_option!(Float32, Float32Array, e, size)
             }
+            ScalarValue::Float16(e) => {
+                build_array_from_option!(Float16, Float16Array, e, size)
+            }
             ScalarValue::Int8(e) => build_array_from_option!(Int8, Int8Array, e, size),
             ScalarValue::Int16(e) => build_array_from_option!(Int16, Int16Array, e, size),
             ScalarValue::Int32(e) => build_array_from_option!(Int32, Int32Array, e, size),
@@ -1966,6 +2100,12 @@ impl ScalarValue {
                 }
                 None => new_null_array(&DataType::Utf8, size),
             },
+            ScalarValue::Utf8View(e) => match e {
+                Some(value) => {
+                    Arc::new(StringViewArray::from_iter_values(repeat(value).take(size)))
+                }
+                None => new_null_array(&DataType::Utf8View, size),
+            },
             ScalarValue::LargeUtf8(e) => match e {
                 Some(value) => {
                     Arc::new(LargeStringArray::from_iter_values(repeat(value).take(size)))
@@ -1980,6 +2120,16 @@ impl ScalarValue {
                 ),
                 None => {
                     Arc::new(repeat(None::<&str>).take(size).collect::<BinaryArray>())
+                }
+            },
+            ScalarValue::BinaryView(e) => match e {
+                Some(value) => Arc::new(
+                    repeat(Some(value.as_slice()))
+                        .take(size)
+                        .collect::<BinaryViewArray>(),
+                ),
+                None => {
+                    Arc::new(repeat(None::<&str>).take(size).collect::<BinaryViewArray>())
                 }
             },
             ScalarValue::FixedSizeBinary(s, e) => match e {
@@ -2115,9 +2265,8 @@ impl ScalarValue {
             ),
             ScalarValue::Union(value, fields, _mode) => match value {
                 Some((v_id, value)) => {
-                    let mut field_type_ids = Vec::<i8>::with_capacity(fields.len());
-                    let mut child_arrays =
-                        Vec::<(Field, ArrayRef)>::with_capacity(fields.len());
+                    let mut new_fields = Vec::with_capacity(fields.len());
+                    let mut child_arrays = Vec::<ArrayRef>::with_capacity(fields.len());
                     for (f_id, field) in fields.iter() {
                         let ar = if f_id == *v_id {
                             value.to_array_of_size(size)?
@@ -2126,14 +2275,14 @@ impl ScalarValue {
                             new_null_array(dt, size)
                         };
                         let field = (**field).clone();
-                        child_arrays.push((field, ar));
-                        field_type_ids.push(f_id);
+                        child_arrays.push(ar);
+                        new_fields.push(field.clone());
                     }
-                    let type_ids = repeat(*v_id).take(size).collect::<Vec<_>>();
-                    let type_ids = Buffer::from_slice_ref(type_ids);
-                    let value_offsets: Option<Buffer> = None;
+                    let type_ids = repeat(*v_id).take(size);
+                    let type_ids = ScalarBuffer::<i8>::from_iter(type_ids);
+                    let value_offsets: Option<ScalarBuffer<i32>> = None;
                     let ar = UnionArray::try_new(
-                        field_type_ids.as_slice(),
+                        fields.clone(),
                         type_ids,
                         value_offsets,
                         child_arrays,
@@ -2195,7 +2344,11 @@ impl ScalarValue {
 
     fn list_to_array_of_size(arr: &dyn Array, size: usize) -> Result<ArrayRef> {
         let arrays = std::iter::repeat(arr).take(size).collect::<Vec<_>>();
-        Ok(arrow::compute::concat(arrays.as_slice())?)
+        let ret = match !arrays.is_empty() {
+            true => arrow::compute::concat(arrays.as_slice())?,
+            false => arr.slice(0, 0),
+        };
+        Ok(ret)
     }
 
     /// Retrieve ScalarValue for each row in `array`
@@ -2235,7 +2388,7 @@ impl ScalarValue {
     /// use datafusion_common::ScalarValue;
     /// use arrow::array::ListArray;
     /// use arrow::datatypes::{DataType, Int32Type};
-    /// use datafusion_common::utils::array_into_list_array;
+    /// use datafusion_common::utils::array_into_list_array_nullable;
     /// use std::sync::Arc;
     ///
     /// let list_arr = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
@@ -2244,7 +2397,7 @@ impl ScalarValue {
     /// ]);
     ///
     /// // Wrap into another layer of list, we got nested array as [ [[1,2,3], [4,5]] ]
-    /// let list_arr = array_into_list_array(Arc::new(list_arr));
+    /// let list_arr = array_into_list_array_nullable(Arc::new(list_arr));
     ///
     /// // Convert the array into Scalar Values for each row, we got 1D arrays in this example
     /// let scalar_vec = ScalarValue::convert_array_to_scalar_vec(&list_arr).unwrap();
@@ -2310,6 +2463,7 @@ impl ScalarValue {
             DataType::Boolean => typed_cast!(array, index, BooleanArray, Boolean)?,
             DataType::Float64 => typed_cast!(array, index, Float64Array, Float64)?,
             DataType::Float32 => typed_cast!(array, index, Float32Array, Float32)?,
+            DataType::Float16 => typed_cast!(array, index, Float16Array, Float16)?,
             DataType::UInt64 => typed_cast!(array, index, UInt64Array, UInt64)?,
             DataType::UInt32 => typed_cast!(array, index, UInt32Array, UInt32)?,
             DataType::UInt16 => typed_cast!(array, index, UInt16Array, UInt16)?,
@@ -2322,15 +2476,20 @@ impl ScalarValue {
             DataType::LargeBinary => {
                 typed_cast!(array, index, LargeBinaryArray, LargeBinary)?
             }
+            DataType::BinaryView => {
+                typed_cast!(array, index, BinaryViewArray, BinaryView)?
+            }
             DataType::Utf8 => typed_cast!(array, index, StringArray, Utf8)?,
             DataType::LargeUtf8 => {
                 typed_cast!(array, index, LargeStringArray, LargeUtf8)?
             }
-            DataType::List(_) => {
+            DataType::Utf8View => typed_cast!(array, index, StringViewArray, Utf8View)?,
+            DataType::List(field) => {
                 let list_array = array.as_list::<i32>();
                 let nested_array = list_array.value(index);
                 // Produces a single element `ListArray` with the value at `index`.
-                let arr = Arc::new(array_into_list_array(nested_array));
+                let arr =
+                    Arc::new(array_into_list_array(nested_array, field.is_nullable()));
 
                 ScalarValue::List(arr)
             }
@@ -2579,6 +2738,9 @@ impl ScalarValue {
             ScalarValue::Boolean(val) => {
                 eq_array_primitive!(array, index, BooleanArray, val)?
             }
+            ScalarValue::Float16(val) => {
+                eq_array_primitive!(array, index, Float16Array, val)?
+            }
             ScalarValue::Float32(val) => {
                 eq_array_primitive!(array, index, Float32Array, val)?
             }
@@ -2610,11 +2772,17 @@ impl ScalarValue {
             ScalarValue::Utf8(val) => {
                 eq_array_primitive!(array, index, StringArray, val)?
             }
+            ScalarValue::Utf8View(val) => {
+                eq_array_primitive!(array, index, StringViewArray, val)?
+            }
             ScalarValue::LargeUtf8(val) => {
                 eq_array_primitive!(array, index, LargeStringArray, val)?
             }
             ScalarValue::Binary(val) => {
                 eq_array_primitive!(array, index, BinaryArray, val)?
+            }
+            ScalarValue::BinaryView(val) => {
+                eq_array_primitive!(array, index, BinaryViewArray, val)?
             }
             ScalarValue::FixedSizeBinary(_, val) => {
                 eq_array_primitive!(array, index, FixedSizeBinaryArray, val)?
@@ -2722,6 +2890,7 @@ impl ScalarValue {
             + match self {
                 ScalarValue::Null
                 | ScalarValue::Boolean(_)
+                | ScalarValue::Float16(_)
                 | ScalarValue::Float32(_)
                 | ScalarValue::Float64(_)
                 | ScalarValue::Decimal128(_, _, _)
@@ -2747,7 +2916,9 @@ impl ScalarValue {
                 | ScalarValue::DurationMillisecond(_)
                 | ScalarValue::DurationMicrosecond(_)
                 | ScalarValue::DurationNanosecond(_) => 0,
-                ScalarValue::Utf8(s) | ScalarValue::LargeUtf8(s) => {
+                ScalarValue::Utf8(s)
+                | ScalarValue::LargeUtf8(s)
+                | ScalarValue::Utf8View(s) => {
                     s.as_ref().map(|s| s.capacity()).unwrap_or_default()
                 }
                 ScalarValue::TimestampSecond(_, s)
@@ -2758,7 +2929,8 @@ impl ScalarValue {
                 }
                 ScalarValue::Binary(b)
                 | ScalarValue::FixedSizeBinary(_, b)
-                | ScalarValue::LargeBinary(b) => {
+                | ScalarValue::LargeBinary(b)
+                | ScalarValue::BinaryView(b) => {
                     b.as_ref().map(|b| b.capacity()).unwrap_or_default()
                 }
                 ScalarValue::List(arr) => arr.get_array_memory_size(),
@@ -3006,6 +3178,7 @@ impl TryFrom<&DataType> for ScalarValue {
     fn try_from(data_type: &DataType) -> Result<Self> {
         Ok(match data_type {
             DataType::Boolean => ScalarValue::Boolean(None),
+            DataType::Float16 => ScalarValue::Float16(None),
             DataType::Float64 => ScalarValue::Float64(None),
             DataType::Float32 => ScalarValue::Float32(None),
             DataType::Int8 => ScalarValue::Int8(None),
@@ -3024,7 +3197,9 @@ impl TryFrom<&DataType> for ScalarValue {
             }
             DataType::Utf8 => ScalarValue::Utf8(None),
             DataType::LargeUtf8 => ScalarValue::LargeUtf8(None),
+            DataType::Utf8View => ScalarValue::Utf8View(None),
             DataType::Binary => ScalarValue::Binary(None),
+            DataType::BinaryView => ScalarValue::BinaryView(None),
             DataType::FixedSizeBinary(len) => ScalarValue::FixedSizeBinary(*len, None),
             DataType::LargeBinary => ScalarValue::LargeBinary(None),
             DataType::Date32 => ScalarValue::Date32(None),
@@ -3073,46 +3248,21 @@ impl TryFrom<&DataType> for ScalarValue {
                 Box::new(value_type.as_ref().try_into()?),
             ),
             // `ScalaValue::List` contains single element `ListArray`.
-            DataType::List(field) => ScalarValue::List(
-                new_null_array(
-                    &DataType::List(Arc::new(Field::new(
-                        "item",
-                        field.data_type().clone(),
-                        true,
-                    ))),
-                    1,
-                )
-                .as_list::<i32>()
-                .to_owned()
-                .into(),
-            ),
-            // 'ScalarValue::LargeList' contains single element `LargeListArray
-            DataType::LargeList(field) => ScalarValue::LargeList(
-                new_null_array(
-                    &DataType::LargeList(Arc::new(Field::new(
-                        "item",
-                        field.data_type().clone(),
-                        true,
-                    ))),
-                    1,
-                )
-                .as_list::<i64>()
-                .to_owned()
-                .into(),
-            ),
+            DataType::List(field_ref) => ScalarValue::List(Arc::new(
+                GenericListArray::new_null(field_ref.clone(), 1),
+            )),
+            // `ScalarValue::LargeList` contains single element `LargeListArray`.
+            DataType::LargeList(field_ref) => ScalarValue::LargeList(Arc::new(
+                GenericListArray::new_null(field_ref.clone(), 1),
+            )),
             // `ScalaValue::FixedSizeList` contains single element `FixedSizeList`.
-            DataType::FixedSizeList(field, _) => ScalarValue::FixedSizeList(
-                new_null_array(
-                    &DataType::FixedSizeList(
-                        Arc::new(Field::new("item", field.data_type().clone(), true)),
-                        1,
-                    ),
+            DataType::FixedSizeList(field_ref, fixed_length) => {
+                ScalarValue::FixedSizeList(Arc::new(FixedSizeListArray::new_null(
+                    field_ref.clone(),
+                    *fixed_length,
                     1,
-                )
-                .as_fixed_size_list()
-                .to_owned()
-                .into(),
-            ),
+                )))
+            }
             DataType::Struct(fields) => ScalarValue::Struct(
                 new_null_array(&DataType::Struct(fields.to_owned()), 1)
                     .as_struct()
@@ -3156,6 +3306,7 @@ impl fmt::Display for ScalarValue {
                 write!(f, "{v:?},{p:?},{s:?}")?;
             }
             ScalarValue::Boolean(e) => format_option!(f, e)?,
+            ScalarValue::Float16(e) => format_option!(f, e)?,
             ScalarValue::Float32(e) => format_option!(f, e)?,
             ScalarValue::Float64(e) => format_option!(f, e)?,
             ScalarValue::Int8(e) => format_option!(f, e)?,
@@ -3170,11 +3321,13 @@ impl fmt::Display for ScalarValue {
             ScalarValue::TimestampMillisecond(e, _) => format_option!(f, e)?,
             ScalarValue::TimestampMicrosecond(e, _) => format_option!(f, e)?,
             ScalarValue::TimestampNanosecond(e, _) => format_option!(f, e)?,
-            ScalarValue::Utf8(e) => format_option!(f, e)?,
-            ScalarValue::LargeUtf8(e) => format_option!(f, e)?,
+            ScalarValue::Utf8(e)
+            | ScalarValue::LargeUtf8(e)
+            | ScalarValue::Utf8View(e) => format_option!(f, e)?,
             ScalarValue::Binary(e)
             | ScalarValue::FixedSizeBinary(_, e)
-            | ScalarValue::LargeBinary(e) => match e {
+            | ScalarValue::LargeBinary(e)
+            | ScalarValue::BinaryView(e) => match e {
                 Some(l) => write!(
                     f,
                     "{}",
@@ -3188,15 +3341,23 @@ impl fmt::Display for ScalarValue {
             ScalarValue::List(arr) => fmt_list(arr.to_owned() as ArrayRef, f)?,
             ScalarValue::LargeList(arr) => fmt_list(arr.to_owned() as ArrayRef, f)?,
             ScalarValue::FixedSizeList(arr) => fmt_list(arr.to_owned() as ArrayRef, f)?,
-            ScalarValue::Date32(e) => format_option!(f, e)?,
-            ScalarValue::Date64(e) => format_option!(f, e)?,
+            ScalarValue::Date32(e) => {
+                format_option!(f, e.map(|v| Date32Type::to_naive_date(v).to_string()))?
+            }
+            ScalarValue::Date64(e) => {
+                format_option!(f, e.map(|v| Date64Type::to_naive_date(v).to_string()))?
+            }
             ScalarValue::Time32Second(e) => format_option!(f, e)?,
             ScalarValue::Time32Millisecond(e) => format_option!(f, e)?,
             ScalarValue::Time64Microsecond(e) => format_option!(f, e)?,
             ScalarValue::Time64Nanosecond(e) => format_option!(f, e)?,
-            ScalarValue::IntervalDayTime(e) => format_option!(f, e)?,
             ScalarValue::IntervalYearMonth(e) => format_option!(f, e)?,
-            ScalarValue::IntervalMonthDayNano(e) => format_option!(f, e)?,
+            ScalarValue::IntervalMonthDayNano(e) => {
+                format_option!(f, e.map(|v| format!("{v:?}")))?
+            }
+            ScalarValue::IntervalDayTime(e) => {
+                format_option!(f, e.map(|v| format!("{v:?}")))?;
+            }
             ScalarValue::DurationSecond(e) => format_option!(f, e)?,
             ScalarValue::DurationMillisecond(e) => format_option!(f, e)?,
             ScalarValue::DurationMicrosecond(e) => format_option!(f, e)?,
@@ -3265,6 +3426,7 @@ impl fmt::Debug for ScalarValue {
             ScalarValue::Decimal128(_, _, _) => write!(f, "Decimal128({self})"),
             ScalarValue::Decimal256(_, _, _) => write!(f, "Decimal256({self})"),
             ScalarValue::Boolean(_) => write!(f, "Boolean({self})"),
+            ScalarValue::Float16(_) => write!(f, "Float16({self})"),
             ScalarValue::Float32(_) => write!(f, "Float32({self})"),
             ScalarValue::Float64(_) => write!(f, "Float64({self})"),
             ScalarValue::Int8(_) => write!(f, "Int8({self})"),
@@ -3289,10 +3451,14 @@ impl fmt::Debug for ScalarValue {
             }
             ScalarValue::Utf8(None) => write!(f, "Utf8({self})"),
             ScalarValue::Utf8(Some(_)) => write!(f, "Utf8(\"{self}\")"),
+            ScalarValue::Utf8View(None) => write!(f, "Utf8View({self})"),
+            ScalarValue::Utf8View(Some(_)) => write!(f, "Utf8View(\"{self}\")"),
             ScalarValue::LargeUtf8(None) => write!(f, "LargeUtf8({self})"),
             ScalarValue::LargeUtf8(Some(_)) => write!(f, "LargeUtf8(\"{self}\")"),
             ScalarValue::Binary(None) => write!(f, "Binary({self})"),
             ScalarValue::Binary(Some(_)) => write!(f, "Binary(\"{self}\")"),
+            ScalarValue::BinaryView(None) => write!(f, "BinaryView({self})"),
+            ScalarValue::BinaryView(Some(_)) => write!(f, "BinaryView(\"{self}\")"),
             ScalarValue::FixedSizeBinary(size, None) => {
                 write!(f, "FixedSizeBinary({size}, {self})")
             }
@@ -3411,8 +3577,6 @@ impl ScalarType<i32> for Date32Type {
 
 #[cfg(test)]
 mod tests {
-    use std::cmp::Ordering;
-    use std::sync::Arc;
 
     use super::*;
     use crate::cast::{
@@ -3420,9 +3584,10 @@ mod tests {
     };
 
     use crate::assert_batches_eq;
+    use crate::utils::array_into_list_array_nullable;
     use arrow::buffer::OffsetBuffer;
     use arrow::compute::{is_null, kernels};
-    use arrow::datatypes::{ArrowNumericType, ArrowPrimitiveType};
+    use arrow::error::ArrowError;
     use arrow::util::pretty::pretty_format_columns;
     use arrow_buffer::Buffer;
     use arrow_schema::Fields;
@@ -3552,6 +3717,12 @@ mod tests {
             &expected_arr,
             as_fixed_size_list_array(actual_arr.as_ref()).unwrap()
         );
+
+        let empty_array = sv
+            .to_array_of_size(0)
+            .expect("Failed to convert to empty array");
+
+        assert_eq!(empty_array.len(), 0);
     }
 
     #[test]
@@ -3562,9 +3733,9 @@ mod tests {
             ScalarValue::from("data-fusion"),
         ];
 
-        let result = ScalarValue::new_list(scalars.as_slice(), &DataType::Utf8);
+        let result = ScalarValue::new_list_nullable(scalars.as_slice(), &DataType::Utf8);
 
-        let expected = array_into_list_array(Arc::new(StringArray::from(vec![
+        let expected = array_into_list_array_nullable(Arc::new(StringArray::from(vec![
             "rust",
             "arrow",
             "data-fusion",
@@ -3776,10 +3947,12 @@ mod tests {
 
     #[test]
     fn iter_to_array_string_test() {
-        let arr1 =
-            array_into_list_array(Arc::new(StringArray::from(vec!["foo", "bar", "baz"])));
-        let arr2 =
-            array_into_list_array(Arc::new(StringArray::from(vec!["rust", "world"])));
+        let arr1 = array_into_list_array_nullable(Arc::new(StringArray::from(vec![
+            "foo", "bar", "baz",
+        ])));
+        let arr2 = array_into_list_array_nullable(Arc::new(StringArray::from(vec![
+            "rust", "world",
+        ])));
 
         let scalars = vec![
             ScalarValue::List(Arc::new(arr1)),
@@ -3960,7 +4133,11 @@ mod tests {
 
     #[test]
     fn test_interval_add_timestamp() -> Result<()> {
-        let interval = ScalarValue::IntervalMonthDayNano(Some(123));
+        let interval = ScalarValue::IntervalMonthDayNano(Some(IntervalMonthDayNano {
+            months: 1,
+            days: 2,
+            nanoseconds: 3,
+        }));
         let timestamp = ScalarValue::TimestampNanosecond(Some(123), None);
         let result = interval.add(&timestamp)?;
         let expect = timestamp.add(&interval)?;
@@ -3972,7 +4149,10 @@ mod tests {
         let expect = timestamp.add(&interval)?;
         assert_eq!(result, expect);
 
-        let interval = ScalarValue::IntervalDayTime(Some(123));
+        let interval = ScalarValue::IntervalDayTime(Some(IntervalDayTime {
+            days: 1,
+            milliseconds: 23,
+        }));
         let timestamp = ScalarValue::TimestampNanosecond(Some(123), None);
         let result = interval.add(&timestamp)?;
         let expect = timestamp.add(&interval)?;
@@ -4179,7 +4359,7 @@ mod tests {
 
     #[test]
     fn scalar_list_null_to_array() {
-        let list_array = ScalarValue::new_list(&[], &DataType::UInt64);
+        let list_array = ScalarValue::new_list_nullable(&[], &DataType::UInt64);
 
         assert_eq!(list_array.len(), 1);
         assert_eq!(list_array.values().len(), 0);
@@ -4200,7 +4380,7 @@ mod tests {
             ScalarValue::UInt64(None),
             ScalarValue::UInt64(Some(101)),
         ];
-        let list_array = ScalarValue::new_list(&values, &DataType::UInt64);
+        let list_array = ScalarValue::new_list_nullable(&values, &DataType::UInt64);
         assert_eq!(list_array.len(), 1);
         assert_eq!(list_array.values().len(), 3);
 
@@ -4452,23 +4632,44 @@ mod tests {
     }
 
     #[test]
-    fn scalar_try_from_list() {
-        let data_type =
-            DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
-        let data_type = &data_type;
+    fn scalar_try_from_list_datatypes() {
+        let inner_field = Arc::new(Field::new("item", DataType::Int32, true));
+
+        // Test for List
+        let data_type = &DataType::List(inner_field.clone());
         let scalar: ScalarValue = data_type.try_into().unwrap();
-
         let expected = ScalarValue::List(
-            new_null_array(
-                &DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
-                1,
-            )
-            .as_list::<i32>()
-            .to_owned()
-            .into(),
+            new_null_array(data_type, 1)
+                .as_list::<i32>()
+                .to_owned()
+                .into(),
         );
+        assert_eq!(expected, scalar);
+        assert!(expected.is_null());
 
-        assert_eq!(expected, scalar)
+        // Test for LargeList
+        let data_type = &DataType::LargeList(inner_field.clone());
+        let scalar: ScalarValue = data_type.try_into().unwrap();
+        let expected = ScalarValue::LargeList(
+            new_null_array(data_type, 1)
+                .as_list::<i64>()
+                .to_owned()
+                .into(),
+        );
+        assert_eq!(expected, scalar);
+        assert!(expected.is_null());
+
+        // Test for FixedSizeList(5)
+        let data_type = &DataType::FixedSizeList(inner_field.clone(), 5);
+        let scalar: ScalarValue = data_type.try_into().unwrap();
+        let expected = ScalarValue::FixedSizeList(
+            new_null_array(data_type, 1)
+                .as_fixed_size_list()
+                .to_owned()
+                .into(),
+        );
+        assert_eq!(expected, scalar);
+        assert!(expected.is_null());
     }
 
     #[test]
@@ -4600,6 +4801,17 @@ mod tests {
         let u64_vals = make_typed_vec!(u8_vals, u64);
 
         let str_vals = [Some("foo"), None, Some("bar")];
+
+        let interval_dt_vals = [
+            Some(IntervalDayTime::MINUS_ONE),
+            None,
+            Some(IntervalDayTime::ONE),
+        ];
+        let interval_mdn_vals = [
+            Some(IntervalMonthDayNano::MINUS_ONE),
+            None,
+            Some(IntervalMonthDayNano::ONE),
+        ];
 
         /// Test each value in `scalar` with the corresponding element
         /// at `array`. Assumes each element is unique (aka not equal
@@ -4746,7 +4958,12 @@ mod tests {
                 Some("UTC".into())
             ),
             make_test_case!(i32_vals, IntervalYearMonthArray, IntervalYearMonth),
-            make_test_case!(i64_vals, IntervalDayTimeArray, IntervalDayTime),
+            make_test_case!(interval_dt_vals, IntervalDayTimeArray, IntervalDayTime),
+            make_test_case!(
+                interval_mdn_vals,
+                IntervalMonthDayNanoArray,
+                IntervalMonthDayNano
+            ),
             make_str_dict_test_case!(str_vals, Int8Type),
             make_str_dict_test_case!(str_vals, Int16Type),
             make_str_dict_test_case!(str_vals, Int32Type),
@@ -5088,13 +5305,13 @@ mod tests {
         // Define list-of-structs scalars
 
         let nl0_array = ScalarValue::iter_to_array(vec![s0.clone(), s1.clone()]).unwrap();
-        let nl0 = ScalarValue::List(Arc::new(array_into_list_array(nl0_array)));
+        let nl0 = ScalarValue::List(Arc::new(array_into_list_array_nullable(nl0_array)));
 
         let nl1_array = ScalarValue::iter_to_array(vec![s2.clone()]).unwrap();
-        let nl1 = ScalarValue::List(Arc::new(array_into_list_array(nl1_array)));
+        let nl1 = ScalarValue::List(Arc::new(array_into_list_array_nullable(nl1_array)));
 
         let nl2_array = ScalarValue::iter_to_array(vec![s1.clone()]).unwrap();
-        let nl2 = ScalarValue::List(Arc::new(array_into_list_array(nl2_array)));
+        let nl2 = ScalarValue::List(Arc::new(array_into_list_array_nullable(nl2_array)));
 
         // iter_to_array for list-of-struct
         let array = ScalarValue::iter_to_array(vec![nl0, nl1, nl2]).unwrap();
@@ -5317,6 +5534,17 @@ mod tests {
             ScalarValue::Utf8(None),
             DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
         );
+
+        // needs https://github.com/apache/arrow-rs/issues/5893
+        /*
+        check_scalar_cast(ScalarValue::Utf8(None), DataType::Utf8View);
+        check_scalar_cast(ScalarValue::from("foo"), DataType::Utf8View);
+        check_scalar_cast(
+            ScalarValue::from("larger than 12 bytes string"),
+            DataType::Utf8View,
+        );
+
+         */
     }
 
     // mimics how casting work on scalar values by `casting` `scalar` to `desired_type`
@@ -5353,6 +5581,88 @@ mod tests {
         let value = ScalarValue::Boolean(None);
         assert!(value.arithmetic_negate().is_err());
         Ok(())
+    }
+
+    #[test]
+    #[allow(arithmetic_overflow)] // we want to test them
+    fn test_scalar_negative_overflows() -> Result<()> {
+        macro_rules! test_overflow_on_value {
+            ($($val:expr),* $(,)?) => {$(
+                {
+                    let value: ScalarValue = $val;
+                    let err = value.arithmetic_negate().expect_err("Should receive overflow error on negating {value:?}");
+                    let root_err = err.find_root();
+                    match  root_err{
+                        DataFusionError::ArrowError(
+                            ArrowError::ComputeError(_),
+                            _,
+                        ) => {}
+                        _ => return Err(err),
+                    };
+                }
+            )*};
+        }
+        test_overflow_on_value!(
+            // the integers
+            i8::MIN.into(),
+            i16::MIN.into(),
+            i32::MIN.into(),
+            i64::MIN.into(),
+            // for decimals, only value needs to be tested
+            ScalarValue::try_new_decimal128(i128::MIN, 10, 5)?,
+            ScalarValue::Decimal256(Some(i256::MIN), 20, 5),
+            // interval, check all possible values
+            ScalarValue::IntervalYearMonth(Some(i32::MIN)),
+            ScalarValue::new_interval_dt(i32::MIN, 999),
+            ScalarValue::new_interval_dt(1, i32::MIN),
+            ScalarValue::new_interval_mdn(i32::MIN, 15, 123_456),
+            ScalarValue::new_interval_mdn(12, i32::MIN, 123_456),
+            ScalarValue::new_interval_mdn(12, 15, i64::MIN),
+            // tz doesn't matter when negating
+            ScalarValue::TimestampSecond(Some(i64::MIN), None),
+            ScalarValue::TimestampMillisecond(Some(i64::MIN), None),
+            ScalarValue::TimestampMicrosecond(Some(i64::MIN), None),
+            ScalarValue::TimestampNanosecond(Some(i64::MIN), None),
+        );
+
+        let float_cases = [
+            (
+                ScalarValue::Float16(Some(f16::MIN)),
+                ScalarValue::Float16(Some(f16::MAX)),
+            ),
+            (
+                ScalarValue::Float16(Some(f16::MAX)),
+                ScalarValue::Float16(Some(f16::MIN)),
+            ),
+            (f32::MIN.into(), f32::MAX.into()),
+            (f32::MAX.into(), f32::MIN.into()),
+            (f64::MIN.into(), f64::MAX.into()),
+            (f64::MAX.into(), f64::MIN.into()),
+        ];
+        // skip float 16 because they aren't supported
+        for (test, expected) in float_cases.into_iter().skip(2) {
+            assert_eq!(test.arithmetic_negate()?, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn f16_test_overflow() {
+        // TODO: if negate supports f16, add these cases to `test_scalar_negative_overflows` test case
+        let cases = [
+            (
+                ScalarValue::Float16(Some(f16::MIN)),
+                ScalarValue::Float16(Some(f16::MAX)),
+            ),
+            (
+                ScalarValue::Float16(Some(f16::MAX)),
+                ScalarValue::Float16(Some(f16::MIN)),
+            ),
+        ];
+
+        for (test, expected) in cases {
+            assert_eq!(test.arithmetic_negate().unwrap(), expected);
+        }
     }
 
     macro_rules! expect_operation_error {
@@ -5507,6 +5817,21 @@ mod tests {
                 5,
             ),
             (
+                ScalarValue::Float16(Some(f16::from_f32(1.1))),
+                ScalarValue::Float16(Some(f16::from_f32(1.9))),
+                1,
+            ),
+            (
+                ScalarValue::Float16(Some(f16::from_f32(-5.3))),
+                ScalarValue::Float16(Some(f16::from_f32(-9.2))),
+                4,
+            ),
+            (
+                ScalarValue::Float16(Some(f16::from_f32(-5.3))),
+                ScalarValue::Float16(Some(f16::from_f32(-9.7))),
+                4,
+            ),
+            (
                 ScalarValue::Float32(Some(1.0)),
                 ScalarValue::Float32(Some(2.0)),
                 1,
@@ -5578,6 +5903,14 @@ mod tests {
             // Different type
             (ScalarValue::Int8(Some(1)), ScalarValue::Int16(Some(1))),
             (ScalarValue::Int8(Some(1)), ScalarValue::Float32(Some(1.0))),
+            (
+                ScalarValue::Float16(Some(f16::from_f32(1.0))),
+                ScalarValue::Float32(Some(1.0)),
+            ),
+            (
+                ScalarValue::Float16(Some(f16::from_f32(1.0))),
+                ScalarValue::Int32(Some(1)),
+            ),
             (
                 ScalarValue::Float64(Some(1.1)),
                 ScalarValue::Float32(Some(2.2)),
@@ -5869,7 +6202,7 @@ mod tests {
     #[test]
     fn test_build_timestamp_millisecond_list() {
         let values = vec![ScalarValue::TimestampMillisecond(Some(1), None)];
-        let arr = ScalarValue::new_list(
+        let arr = ScalarValue::new_list_nullable(
             &values,
             &DataType::Timestamp(TimeUnit::Millisecond, None),
         );
@@ -5880,7 +6213,7 @@ mod tests {
     fn test_newlist_timestamp_zone() {
         let s: &'static str = "UTC";
         let values = vec![ScalarValue::TimestampMillisecond(Some(1), Some(s.into()))];
-        let arr = ScalarValue::new_list(
+        let arr = ScalarValue::new_list_nullable(
             &values,
             &DataType::Timestamp(TimeUnit::Millisecond, Some(s.into())),
         );

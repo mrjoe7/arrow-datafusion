@@ -34,10 +34,12 @@ pub mod concat;
 pub mod dimension;
 pub mod empty;
 pub mod except;
+pub mod expr_ext;
 pub mod extract;
 pub mod flatten;
 pub mod length;
 pub mod make_array;
+pub mod planner;
 pub mod position;
 pub mod range;
 pub mod remove;
@@ -45,12 +47,10 @@ pub mod repeat;
 pub mod replace;
 pub mod resize;
 pub mod reverse;
-pub mod rewrite;
 pub mod set_ops;
 pub mod sort;
 pub mod string;
 pub mod utils;
-
 use datafusion_common::Result;
 use datafusion_execution::FunctionRegistry;
 use datafusion_expr::ScalarUDF;
@@ -98,9 +98,9 @@ pub mod expr_fn {
     pub use super::string::string_to_array;
 }
 
-/// Registers all enabled packages with a [`FunctionRegistry`]
-pub fn register_all(registry: &mut dyn FunctionRegistry) -> Result<()> {
-    let functions: Vec<Arc<ScalarUDF>> = vec![
+/// Return all default array functions
+pub fn all_default_array_functions() -> Vec<Arc<ScalarUDF>> {
+    vec![
         string::array_to_string_udf(),
         string::string_to_array_udf(),
         range::range_udf(),
@@ -138,7 +138,12 @@ pub fn register_all(registry: &mut dyn FunctionRegistry) -> Result<()> {
         replace::array_replace_n_udf(),
         replace::array_replace_all_udf(),
         replace::array_replace_udf(),
-    ];
+    ]
+}
+
+/// Registers all enabled packages with a [`FunctionRegistry`]
+pub fn register_all(registry: &mut dyn FunctionRegistry) -> Result<()> {
+    let functions: Vec<Arc<ScalarUDF>> = all_default_array_functions();
     functions.into_iter().try_for_each(|udf| {
         let existing_udf = registry.register_udf(udf)?;
         if let Some(existing_udf) = existing_udf {
@@ -146,7 +151,33 @@ pub fn register_all(registry: &mut dyn FunctionRegistry) -> Result<()> {
         }
         Ok(()) as Result<()>
     })?;
-    registry.register_function_rewrite(Arc::new(rewrite::ArrayFunctionRewriter {}))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::all_default_array_functions;
+    use datafusion_common::Result;
+    use std::collections::HashSet;
+
+    #[test]
+    fn test_no_duplicate_name() -> Result<()> {
+        let mut names = HashSet::new();
+        for func in all_default_array_functions() {
+            assert!(
+                names.insert(func.name().to_string().to_lowercase()),
+                "duplicate function name: {}",
+                func.name()
+            );
+            for alias in func.aliases() {
+                assert!(
+                    names.insert(alias.to_string().to_lowercase()),
+                    "duplicate function name: {}",
+                    alias
+                );
+            }
+        }
+        Ok(())
+    }
 }

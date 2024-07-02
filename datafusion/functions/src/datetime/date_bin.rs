@@ -29,15 +29,16 @@ use arrow::datatypes::DataType::{Null, Timestamp, Utf8};
 use arrow::datatypes::IntervalUnit::{DayTime, MonthDayNano};
 use arrow::datatypes::TimeUnit::{Microsecond, Millisecond, Nanosecond, Second};
 use arrow::datatypes::{DataType, TimeUnit};
-use chrono::{DateTime, Datelike, Duration, Months, TimeDelta, Utc};
 
 use datafusion_common::cast::as_primitive_array;
 use datafusion_common::{exec_err, not_impl_err, plan_err, Result, ScalarValue};
+use datafusion_expr::sort_properties::{ExprProperties, SortProperties};
 use datafusion_expr::TypeSignature::Exact;
 use datafusion_expr::{
-    ColumnarValue, FuncMonotonicity, ScalarUDFImpl, Signature, Volatility,
-    TIMEZONE_WILDCARD,
+    ColumnarValue, ScalarUDFImpl, Signature, Volatility, TIMEZONE_WILDCARD,
 };
+
+use chrono::{DateTime, Datelike, Duration, Months, TimeDelta, Utc};
 
 #[derive(Debug)]
 pub struct DateBinFunc {
@@ -146,8 +147,21 @@ impl ScalarUDFImpl for DateBinFunc {
         }
     }
 
-    fn monotonicity(&self) -> Result<Option<FuncMonotonicity>> {
-        Ok(Some(vec![None, Some(true)]))
+    fn output_ordering(&self, input: &[ExprProperties]) -> Result<SortProperties> {
+        // The DATE_BIN function preserves the order of its second argument.
+        let step = &input[0];
+        let date_value = &input[1];
+        let reference = input.get(2);
+
+        if step.sort_properties.eq(&SortProperties::Singleton)
+            && reference
+                .map(|r| r.sort_properties.eq(&SortProperties::Singleton))
+                .unwrap_or(true)
+        {
+            Ok(date_value.sort_properties)
+        } else {
+            Ok(SortProperties::Unordered)
+        }
     }
 }
 
@@ -320,14 +334,14 @@ fn date_bin_impl(
         origin: i64,
         stride: i64,
         stride_fn: fn(i64, i64, i64) -> i64,
-    ) -> impl Fn(Option<i64>) -> Option<i64> {
+    ) -> impl Fn(i64) -> i64 {
         let scale = match T::UNIT {
             Nanosecond => 1,
             Microsecond => NANOSECONDS / 1_000_000,
             Millisecond => NANOSECONDS / 1_000,
             Second => NANOSECONDS,
         };
-        move |x: Option<i64>| x.map(|x| stride_fn(stride, x * scale, origin) / scale)
+        move |x: i64| stride_fn(stride, x * scale, origin) / scale
     }
 
     Ok(match array {
@@ -335,7 +349,7 @@ fn date_bin_impl(
             let apply_stride_fn =
                 stride_map_fn::<TimestampNanosecondType>(origin, stride, stride_fn);
             ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(
-                apply_stride_fn(*v),
+                v.map(apply_stride_fn),
                 tz_opt.clone(),
             ))
         }
@@ -343,7 +357,7 @@ fn date_bin_impl(
             let apply_stride_fn =
                 stride_map_fn::<TimestampMicrosecondType>(origin, stride, stride_fn);
             ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(
-                apply_stride_fn(*v),
+                v.map(apply_stride_fn),
                 tz_opt.clone(),
             ))
         }
@@ -351,7 +365,7 @@ fn date_bin_impl(
             let apply_stride_fn =
                 stride_map_fn::<TimestampMillisecondType>(origin, stride, stride_fn);
             ColumnarValue::Scalar(ScalarValue::TimestampMillisecond(
-                apply_stride_fn(*v),
+                v.map(apply_stride_fn),
                 tz_opt.clone(),
             ))
         }
@@ -359,7 +373,7 @@ fn date_bin_impl(
             let apply_stride_fn =
                 stride_map_fn::<TimestampSecondType>(origin, stride, stride_fn);
             ColumnarValue::Scalar(ScalarValue::TimestampSecond(
-                apply_stride_fn(*v),
+                v.map(apply_stride_fn),
                 tz_opt.clone(),
             ))
         }
@@ -377,14 +391,13 @@ fn date_bin_impl(
             {
                 let array = as_primitive_array::<T>(array)?;
                 let apply_stride_fn = stride_map_fn::<T>(origin, stride, stride_fn);
-                let array = array
-                    .iter()
-                    .map(apply_stride_fn)
-                    .collect::<PrimitiveArray<T>>()
+                let array: PrimitiveArray<T> = array
+                    .unary(apply_stride_fn)
                     .with_timezone_opt(tz_opt.clone());
 
                 Ok(ColumnarValue::Array(Arc::new(array)))
             }
+
             match array.data_type() {
                 Timestamp(Nanosecond, tz_opt) => {
                     transform_array_with_stride::<TimestampNanosecondType>(
@@ -426,21 +439,25 @@ fn date_bin_impl(
 mod tests {
     use std::sync::Arc;
 
+    use crate::datetime::date_bin::{date_bin_nanos_interval, DateBinFunc};
     use arrow::array::types::TimestampNanosecondType;
     use arrow::array::{IntervalDayTimeArray, TimestampNanosecondArray};
     use arrow::compute::kernels::cast_utils::string_to_timestamp_nanos;
     use arrow::datatypes::{DataType, TimeUnit};
-    use chrono::TimeDelta;
 
+    use arrow_buffer::{IntervalDayTime, IntervalMonthDayNano};
     use datafusion_common::ScalarValue;
     use datafusion_expr::{ColumnarValue, ScalarUDFImpl};
 
-    use crate::datetime::date_bin::{date_bin_nanos_interval, DateBinFunc};
+    use chrono::TimeDelta;
 
     #[test]
     fn test_date_bin() {
         let res = DateBinFunc::new().invoke(&[
-            ColumnarValue::Scalar(ScalarValue::IntervalDayTime(Some(1))),
+            ColumnarValue::Scalar(ScalarValue::IntervalDayTime(Some(IntervalDayTime {
+                days: 0,
+                milliseconds: 1,
+            }))),
             ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(Some(1), None)),
             ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(Some(1), None)),
         ]);
@@ -448,21 +465,33 @@ mod tests {
 
         let timestamps = Arc::new((1..6).map(Some).collect::<TimestampNanosecondArray>());
         let res = DateBinFunc::new().invoke(&[
-            ColumnarValue::Scalar(ScalarValue::IntervalDayTime(Some(1))),
+            ColumnarValue::Scalar(ScalarValue::IntervalDayTime(Some(IntervalDayTime {
+                days: 0,
+                milliseconds: 1,
+            }))),
             ColumnarValue::Array(timestamps),
             ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(Some(1), None)),
         ]);
         assert!(res.is_ok());
 
         let res = DateBinFunc::new().invoke(&[
-            ColumnarValue::Scalar(ScalarValue::IntervalDayTime(Some(1))),
+            ColumnarValue::Scalar(ScalarValue::IntervalDayTime(Some(IntervalDayTime {
+                days: 0,
+                milliseconds: 1,
+            }))),
             ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(Some(1), None)),
         ]);
         assert!(res.is_ok());
 
         // stride supports month-day-nano
         let res = DateBinFunc::new().invoke(&[
-            ColumnarValue::Scalar(ScalarValue::IntervalMonthDayNano(Some(1))),
+            ColumnarValue::Scalar(ScalarValue::IntervalMonthDayNano(Some(
+                IntervalMonthDayNano {
+                    months: 0,
+                    days: 0,
+                    nanoseconds: 1,
+                },
+            ))),
             ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(Some(1), None)),
             ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(Some(1), None)),
         ]);
@@ -473,8 +502,12 @@ mod tests {
         //
 
         // invalid number of arguments
-        let res = DateBinFunc::new()
-            .invoke(&[ColumnarValue::Scalar(ScalarValue::IntervalDayTime(Some(1)))]);
+        let res = DateBinFunc::new().invoke(&[ColumnarValue::Scalar(
+            ScalarValue::IntervalDayTime(Some(IntervalDayTime {
+                days: 0,
+                milliseconds: 1,
+            })),
+        )]);
         assert_eq!(
             res.err().unwrap().strip_backtrace(),
             "Execution error: DATE_BIN expected two or three arguments"
@@ -493,7 +526,10 @@ mod tests {
 
         // stride: invalid value
         let res = DateBinFunc::new().invoke(&[
-            ColumnarValue::Scalar(ScalarValue::IntervalDayTime(Some(0))),
+            ColumnarValue::Scalar(ScalarValue::IntervalDayTime(Some(IntervalDayTime {
+                days: 0,
+                milliseconds: 0,
+            }))),
             ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(Some(1), None)),
             ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(Some(1), None)),
         ]);
@@ -504,7 +540,9 @@ mod tests {
 
         // stride: overflow of day-time interval
         let res = DateBinFunc::new().invoke(&[
-            ColumnarValue::Scalar(ScalarValue::IntervalDayTime(Some(i64::MAX))),
+            ColumnarValue::Scalar(ScalarValue::IntervalDayTime(Some(
+                IntervalDayTime::MAX,
+            ))),
             ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(Some(1), None)),
             ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(Some(1), None)),
         ]);
@@ -537,7 +575,10 @@ mod tests {
 
         // origin: invalid type
         let res = DateBinFunc::new().invoke(&[
-            ColumnarValue::Scalar(ScalarValue::IntervalDayTime(Some(1))),
+            ColumnarValue::Scalar(ScalarValue::IntervalDayTime(Some(IntervalDayTime {
+                days: 0,
+                milliseconds: 1,
+            }))),
             ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(Some(1), None)),
             ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(Some(1), None)),
         ]);
@@ -547,14 +588,26 @@ mod tests {
         );
 
         let res = DateBinFunc::new().invoke(&[
-            ColumnarValue::Scalar(ScalarValue::IntervalDayTime(Some(1))),
+            ColumnarValue::Scalar(ScalarValue::IntervalDayTime(Some(IntervalDayTime {
+                days: 0,
+                milliseconds: 1,
+            }))),
             ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(Some(1), None)),
             ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(Some(1), None)),
         ]);
         assert!(res.is_ok());
 
         // unsupported array type for stride
-        let intervals = Arc::new((1..6).map(Some).collect::<IntervalDayTimeArray>());
+        let intervals = Arc::new(
+            (1..6)
+                .map(|x| {
+                    Some(IntervalDayTime {
+                        days: 0,
+                        milliseconds: x,
+                    })
+                })
+                .collect::<IntervalDayTimeArray>(),
+        );
         let res = DateBinFunc::new().invoke(&[
             ColumnarValue::Array(intervals),
             ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(Some(1), None)),
@@ -568,7 +621,10 @@ mod tests {
         // unsupported array type for origin
         let timestamps = Arc::new((1..6).map(Some).collect::<TimestampNanosecondArray>());
         let res = DateBinFunc::new().invoke(&[
-            ColumnarValue::Scalar(ScalarValue::IntervalDayTime(Some(1))),
+            ColumnarValue::Scalar(ScalarValue::IntervalDayTime(Some(IntervalDayTime {
+                days: 0,
+                milliseconds: 1,
+            }))),
             ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(Some(1), None)),
             ColumnarValue::Array(timestamps),
         ]);

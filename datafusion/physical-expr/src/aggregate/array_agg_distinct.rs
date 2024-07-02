@@ -74,22 +74,23 @@ impl AggregateExpr for DistinctArrayAgg {
         Ok(Field::new_list(
             &self.name,
             // This should be the same as return type of AggregateFunction::ArrayAgg
-            Field::new("item", self.input_data_type.clone(), true),
-            self.nullable,
+            Field::new("item", self.input_data_type.clone(), self.nullable),
+            false,
         ))
     }
 
     fn create_accumulator(&self) -> Result<Box<dyn Accumulator>> {
         Ok(Box::new(DistinctArrayAggAccumulator::try_new(
             &self.input_data_type,
+            self.nullable,
         )?))
     }
 
     fn state_fields(&self) -> Result<Vec<Field>> {
         Ok(vec![Field::new_list(
             format_state_name(&self.name, "distinct_array_agg"),
-            Field::new("item", self.input_data_type.clone(), true),
-            self.nullable,
+            Field::new("item", self.input_data_type.clone(), self.nullable),
+            false,
         )])
     }
 
@@ -119,13 +120,15 @@ impl PartialEq<dyn Any> for DistinctArrayAgg {
 struct DistinctArrayAggAccumulator {
     values: HashSet<ScalarValue>,
     datatype: DataType,
+    nullable: bool,
 }
 
 impl DistinctArrayAggAccumulator {
-    pub fn try_new(datatype: &DataType) -> Result<Self> {
+    pub fn try_new(datatype: &DataType, nullable: bool) -> Result<Self> {
         Ok(Self {
             values: HashSet::new(),
             datatype: datatype.clone(),
+            nullable,
         })
     }
 }
@@ -153,17 +156,16 @@ impl Accumulator for DistinctArrayAggAccumulator {
             return Ok(());
         }
 
-        let array = &states[0];
-
-        assert_eq!(array.len(), 1, "state array should only include 1 row!");
-        // Unwrap outer ListArray then do update batch
-        let inner_array = array.as_list::<i32>().value(0);
-        self.update_batch(&[inner_array])
+        states[0]
+            .as_list::<i32>()
+            .iter()
+            .flatten()
+            .try_for_each(|val| self.update_batch(&[val]))
     }
 
     fn evaluate(&mut self) -> Result<ScalarValue> {
         let values: Vec<ScalarValue> = self.values.iter().cloned().collect();
-        let arr = ScalarValue::new_list(&values, &self.datatype);
+        let arr = ScalarValue::new_list(&values, &self.datatype, self.nullable);
         Ok(ScalarValue::List(arr))
     }
 
@@ -181,8 +183,8 @@ mod tests {
     use super::*;
     use crate::expressions::col;
     use crate::expressions::tests::aggregate;
-    use arrow::array::{ArrayRef, Int32Array};
-    use arrow::datatypes::{DataType, Schema};
+    use arrow::array::Int32Array;
+    use arrow::datatypes::Schema;
     use arrow::record_batch::RecordBatch;
     use arrow_array::types::Int32Type;
     use arrow_array::Array;

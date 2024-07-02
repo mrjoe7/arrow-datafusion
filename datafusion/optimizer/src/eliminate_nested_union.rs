@@ -15,9 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Optimizer rule to replace nested unions to single union.
+//! [`EliminateNestedUnion`]: flattens nested `Union` to a single `Union`
 use crate::optimizer::ApplyOrder;
 use crate::{OptimizerConfig, OptimizerRule};
+use datafusion_common::tree_node::Transformed;
 use datafusion_common::Result;
 use datafusion_expr::expr_rewriter::coerce_plan_expr_for_schema;
 use datafusion_expr::{Distinct, LogicalPlan, Union};
@@ -35,11 +36,23 @@ impl EliminateNestedUnion {
 }
 
 impl OptimizerRule for EliminateNestedUnion {
-    fn try_optimize(
+    fn name(&self) -> &str {
+        "eliminate_nested_union"
+    }
+
+    fn apply_order(&self) -> Option<ApplyOrder> {
+        Some(ApplyOrder::BottomUp)
+    }
+
+    fn supports_rewrite(&self) -> bool {
+        true
+    }
+
+    fn rewrite(
         &self,
-        plan: &LogicalPlan,
+        plan: LogicalPlan,
         _config: &dyn OptimizerConfig,
-    ) -> Result<Option<LogicalPlan>> {
+    ) -> Result<Transformed<LogicalPlan>> {
         match plan {
             LogicalPlan::Union(Union { inputs, schema }) => {
                 let inputs = inputs
@@ -47,38 +60,32 @@ impl OptimizerRule for EliminateNestedUnion {
                     .flat_map(extract_plans_from_union)
                     .collect::<Vec<_>>();
 
-                Ok(Some(LogicalPlan::Union(Union {
+                Ok(Transformed::yes(LogicalPlan::Union(Union {
                     inputs,
-                    schema: schema.clone(),
+                    schema,
                 })))
             }
-            LogicalPlan::Distinct(Distinct::All(plan)) => match plan.as_ref() {
-                LogicalPlan::Union(Union { inputs, schema }) => {
-                    let inputs = inputs
-                        .iter()
-                        .map(extract_plan_from_distinct)
-                        .flat_map(extract_plans_from_union)
-                        .collect::<Vec<_>>();
+            LogicalPlan::Distinct(Distinct::All(ref nested_plan)) => {
+                match nested_plan.as_ref() {
+                    LogicalPlan::Union(Union { inputs, schema }) => {
+                        let inputs = inputs
+                            .iter()
+                            .map(extract_plan_from_distinct)
+                            .flat_map(extract_plans_from_union)
+                            .collect::<Vec<_>>();
 
-                    Ok(Some(LogicalPlan::Distinct(Distinct::All(Arc::new(
-                        LogicalPlan::Union(Union {
-                            inputs,
-                            schema: schema.clone(),
-                        }),
-                    )))))
+                        Ok(Transformed::yes(LogicalPlan::Distinct(Distinct::All(
+                            Arc::new(LogicalPlan::Union(Union {
+                                inputs,
+                                schema: schema.clone(),
+                            })),
+                        ))))
+                    }
+                    _ => Ok(Transformed::no(plan)),
                 }
-                _ => Ok(None),
-            },
-            _ => Ok(None),
+            }
+            _ => Ok(Transformed::no(plan)),
         }
-    }
-
-    fn name(&self) -> &str {
-        "eliminate_nested_union"
-    }
-
-    fn apply_order(&self) -> Option<ApplyOrder> {
-        Some(ApplyOrder::BottomUp)
     }
 }
 
@@ -114,7 +121,7 @@ mod tests {
         ])
     }
 
-    fn assert_optimized_plan_equal(plan: &LogicalPlan, expected: &str) -> Result<()> {
+    fn assert_optimized_plan_equal(plan: LogicalPlan, expected: &str) -> Result<()> {
         assert_optimized_plan_eq(Arc::new(EliminateNestedUnion::new()), plan, expected)
     }
 
@@ -131,7 +138,7 @@ mod tests {
         Union\
         \n  TableScan: table\
         \n  TableScan: table";
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
@@ -147,7 +154,7 @@ mod tests {
         \n  Union\
         \n    TableScan: table\
         \n    TableScan: table";
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
@@ -167,7 +174,7 @@ mod tests {
         \n  TableScan: table\
         \n  TableScan: table\
         \n  TableScan: table";
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
@@ -188,7 +195,7 @@ mod tests {
         \n      TableScan: table\
         \n  TableScan: table\
         \n  TableScan: table";
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
@@ -210,7 +217,7 @@ mod tests {
         \n    TableScan: table\
         \n    TableScan: table\
         \n    TableScan: table";
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
@@ -230,7 +237,7 @@ mod tests {
         \n    TableScan: table\
         \n    TableScan: table\
         \n    TableScan: table";
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     // We don't need to use project_with_column_index in logical optimizer,
@@ -261,7 +268,7 @@ mod tests {
         \n    TableScan: table\
         \n  Projection: table.id AS id, table.key, table.value\
         \n    TableScan: table";
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
@@ -291,7 +298,7 @@ mod tests {
         \n      TableScan: table\
         \n    Projection: table.id AS id, table.key, table.value\
         \n      TableScan: table";
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
@@ -337,7 +344,7 @@ mod tests {
         \n    TableScan: table_1\
         \n  Projection: CAST(table_1.id AS Int64) AS id, table_1.key, CAST(table_1.value AS Float64) AS value\
         \n    TableScan: table_1";
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
@@ -384,6 +391,6 @@ mod tests {
         \n      TableScan: table_1\
         \n    Projection: CAST(table_1.id AS Int64) AS id, table_1.key, CAST(table_1.value AS Float64) AS value\
         \n      TableScan: table_1";
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 }

@@ -18,13 +18,13 @@
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
-use datafusion_common::{plan_err, Result, ScalarValue};
+use datafusion_common::{plan_err, DataFusionError, Result, ScalarValue};
 use datafusion_expr::{
     AggregateUDF, Between, Expr, Filter, LogicalPlan, ScalarUDF, TableSource, WindowUDF,
 };
 use datafusion_optimizer::analyzer::{Analyzer, AnalyzerRule};
-use datafusion_optimizer::optimizer::Optimizer;
-use datafusion_optimizer::{utils, OptimizerConfig, OptimizerContext, OptimizerRule};
+use datafusion_optimizer::optimizer::{ApplyOrder, Optimizer};
+use datafusion_optimizer::{OptimizerConfig, OptimizerContext, OptimizerRule};
 use datafusion_sql::planner::{ContextProvider, SqlToRel};
 use datafusion_sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion_sql::sqlparser::parser::Parser;
@@ -51,7 +51,7 @@ pub fn main() -> Result<()> {
     let config = OptimizerContext::default().with_skip_failing_rules(false);
     let analyzer = Analyzer::with_rules(vec![Arc::new(MyAnalyzerRule {})]);
     let analyzed_plan =
-        analyzer.execute_and_check(&logical_plan, config.options(), |_, _| {})?;
+        analyzer.execute_and_check(logical_plan, config.options(), |_, _| {})?;
     println!(
         "Analyzed Logical Plan:\n\n{}\n",
         analyzed_plan.display_indent()
@@ -59,7 +59,7 @@ pub fn main() -> Result<()> {
 
     // then run the optimizer with our custom rule
     let optimizer = Optimizer::with_rules(vec![Arc::new(MyOptimizerRule {})]);
-    let optimized_plan = optimizer.optimize(&analyzed_plan, &config, observe)?;
+    let optimized_plan = optimizer.optimize(analyzed_plan, &config, observe)?;
     println!(
         "Optimized Logical Plan:\n\n{}\n",
         optimized_plan.display_indent()
@@ -91,7 +91,7 @@ impl AnalyzerRule for MyAnalyzerRule {
 
 impl MyAnalyzerRule {
     fn analyze_plan(plan: LogicalPlan) -> Result<LogicalPlan> {
-        plan.transform(&|plan| {
+        plan.transform(|plan| {
             Ok(match plan {
                 LogicalPlan::Filter(filter) => {
                     let predicate = Self::analyze_expr(filter.predicate.clone())?;
@@ -107,7 +107,7 @@ impl MyAnalyzerRule {
     }
 
     fn analyze_expr(expr: Expr) -> Result<Expr> {
-        expr.transform(&|expr| {
+        expr.transform(|expr| {
             // closure is invoked for all sub expressions
             Ok(match expr {
                 Expr::Literal(ScalarValue::Int64(i)) => {
@@ -131,39 +131,35 @@ impl OptimizerRule for MyOptimizerRule {
         "my_optimizer_rule"
     }
 
-    fn try_optimize(
+    fn apply_order(&self) -> Option<ApplyOrder> {
+        Some(ApplyOrder::BottomUp)
+    }
+
+    fn supports_rewrite(&self) -> bool {
+        true
+    }
+
+    fn rewrite(
         &self,
-        plan: &LogicalPlan,
-        config: &dyn OptimizerConfig,
-    ) -> Result<Option<LogicalPlan>> {
-        // recurse down and optimize children first
-        let optimized_plan = utils::optimize_children(self, plan, config)?;
-        match optimized_plan {
-            Some(LogicalPlan::Filter(filter)) => {
+        plan: LogicalPlan,
+        _config: &dyn OptimizerConfig,
+    ) -> Result<Transformed<LogicalPlan>, DataFusionError> {
+        match plan {
+            LogicalPlan::Filter(filter) => {
                 let predicate = my_rewrite(filter.predicate.clone())?;
-                Ok(Some(LogicalPlan::Filter(Filter::try_new(
+                Ok(Transformed::yes(LogicalPlan::Filter(Filter::try_new(
                     predicate,
-                    filter.input,
+                    filter.input.clone(),
                 )?)))
             }
-            Some(optimized_plan) => Ok(Some(optimized_plan)),
-            None => match plan {
-                LogicalPlan::Filter(filter) => {
-                    let predicate = my_rewrite(filter.predicate.clone())?;
-                    Ok(Some(LogicalPlan::Filter(Filter::try_new(
-                        predicate,
-                        filter.input.clone(),
-                    )?)))
-                }
-                _ => Ok(None),
-            },
+            _ => Ok(Transformed::no(plan)),
         }
     }
 }
 
 /// use rewrite_expr to modify the expression tree.
 fn my_rewrite(expr: Expr) -> Result<Expr> {
-    expr.transform(&|expr| {
+    expr.transform(|expr| {
         // closure is invoked for all sub expressions
         Ok(match expr {
             Expr::Between(Between {
@@ -227,15 +223,15 @@ impl ContextProvider for MyContextProvider {
         &self.options
     }
 
-    fn udfs_names(&self) -> Vec<String> {
+    fn udf_names(&self) -> Vec<String> {
         Vec::new()
     }
 
-    fn udafs_names(&self) -> Vec<String> {
+    fn udaf_names(&self) -> Vec<String> {
         Vec::new()
     }
 
-    fn udwfs_names(&self) -> Vec<String> {
+    fn udwf_names(&self) -> Vec<String> {
         Vec::new()
     }
 }

@@ -20,8 +20,9 @@ use std::fmt::{self, Display};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use datafusion_common::config::FormatOptions;
-use datafusion_common::{DFSchemaRef, OwnedTableReference};
+use arrow::datatypes::{DataType, Field, Schema};
+use datafusion_common::file_options::file_type::FileType;
+use datafusion_common::{DFSchemaRef, TableReference};
 
 use crate::LogicalPlan;
 
@@ -34,8 +35,8 @@ pub struct CopyTo {
     pub output_url: String,
     /// Determines which, if any, columns should be used for hive-style partitioned writes
     pub partition_by: Vec<String>,
-    /// File format options.
-    pub format_options: FormatOptions,
+    /// File type trait
+    pub file_type: Arc<dyn FileType>,
     /// SQL Options that can affect the formats
     pub options: HashMap<String, String>,
 }
@@ -63,16 +64,36 @@ impl Hash for CopyTo {
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct DmlStatement {
     /// The table name
-    pub table_name: OwnedTableReference,
+    pub table_name: TableReference,
     /// The schema of the table (must align with Rel input)
     pub table_schema: DFSchemaRef,
     /// The type of operation to perform
     pub op: WriteOp,
     /// The relation that determines the tuples to add/remove/modify the schema must match with table_schema
     pub input: Arc<LogicalPlan>,
+    /// The schema of the output relation
+    pub output_schema: DFSchemaRef,
 }
 
 impl DmlStatement {
+    /// Creates a new DML statement with the output schema set to a single `count` column.
+    pub fn new(
+        table_name: TableReference,
+        table_schema: DFSchemaRef,
+        op: WriteOp,
+        input: Arc<LogicalPlan>,
+    ) -> Self {
+        Self {
+            table_name,
+            table_schema,
+            op,
+            input,
+
+            // The output schema is always a single column with the number of rows affected
+            output_schema: make_count_schema(),
+        }
+    }
+
     /// Return a descriptive name of this [`DmlStatement`]
     pub fn name(&self) -> &str {
         self.op.name()
@@ -105,4 +126,12 @@ impl Display for WriteOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.name())
     }
+}
+
+fn make_count_schema() -> DFSchemaRef {
+    Arc::new(
+        Schema::new(vec![Field::new("count", DataType::UInt64, false)])
+            .try_into()
+            .unwrap(),
+    )
 }

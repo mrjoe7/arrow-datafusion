@@ -29,6 +29,7 @@ use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::{
     Transformed, TransformedResult, TreeNode, TreeNodeRewriter,
 };
+use datafusion_common::TableReference;
 use datafusion_common::{Column, DFSchema, Result};
 
 mod order_by;
@@ -42,6 +43,7 @@ pub use order_by::rewrite_sort_cols_by_aggs;
 /// For example, concatenating arrays `a || b` is represented as
 /// `Operator::ArrowAt`, but can be implemented by calling a function
 /// `array_concat` from the `functions-array` crate.
+// This is not used in datafusion internally, but it is still helpful for downstream project so don't remove it.
 pub trait FunctionRewrite {
     /// Return a human readable name for this rewrite
     fn name(&self) -> &str;
@@ -61,7 +63,7 @@ pub trait FunctionRewrite {
 /// Recursively call [`Column::normalize_with_schemas`] on all [`Column`] expressions
 /// in the `expr` expression tree.
 pub fn normalize_col(expr: Expr, plan: &LogicalPlan) -> Result<Expr> {
-    expr.transform(&|expr| {
+    expr.transform(|expr| {
         Ok({
             if let Expr::Column(c) = expr {
                 let col = LogicalPlanBuilder::normalize(plan, c)?;
@@ -81,16 +83,16 @@ pub fn normalize_col_with_schemas_and_ambiguity_check(
     using_columns: &[HashSet<Column>],
 ) -> Result<Expr> {
     // Normalize column inside Unnest
-    if let Expr::Unnest(Unnest { exprs }) = expr {
+    if let Expr::Unnest(Unnest { expr }) = expr {
         let e = normalize_col_with_schemas_and_ambiguity_check(
-            exprs[0].clone(),
+            expr.as_ref().clone(),
             schemas,
             using_columns,
         )?;
-        return Ok(Expr::Unnest(Unnest { exprs: vec![e] }));
+        return Ok(Expr::Unnest(Unnest { expr: Box::new(e) }));
     }
 
-    expr.transform(&|expr| {
+    expr.transform(|expr| {
         Ok({
             if let Expr::Column(c) = expr {
                 let col =
@@ -118,7 +120,7 @@ pub fn normalize_cols(
 /// Recursively replace all [`Column`] expressions in a given expression tree with
 /// `Column` expressions provided by the hash map argument.
 pub fn replace_col(expr: Expr, replace_map: &HashMap<&Column, &Column>) -> Result<Expr> {
-    expr.transform(&|expr| {
+    expr.transform(|expr| {
         Ok({
             if let Expr::Column(c) = &expr {
                 match replace_map.get(c) {
@@ -139,7 +141,7 @@ pub fn replace_col(expr: Expr, replace_map: &HashMap<&Column, &Column>) -> Resul
 /// For example, if there were expressions like `foo.bar` this would
 /// rewrite it to just `bar`.
 pub fn unnormalize_col(expr: Expr) -> Expr {
-    expr.transform(&|expr| {
+    expr.transform(|expr| {
         Ok({
             if let Expr::Column(c) = expr {
                 let col = Column {
@@ -162,13 +164,20 @@ pub fn create_col_from_scalar_expr(
     subqry_alias: String,
 ) -> Result<Column> {
     match scalar_expr {
-        Expr::Alias(Alias { name, .. }) => Ok(Column::new(Some(subqry_alias), name)),
-        Expr::Column(Column { relation: _, name }) => {
-            Ok(Column::new(Some(subqry_alias), name))
-        }
+        Expr::Alias(Alias { name, .. }) => Ok(Column::new(
+            Some::<TableReference>(subqry_alias.into()),
+            name,
+        )),
+        Expr::Column(Column { relation: _, name }) => Ok(Column::new(
+            Some::<TableReference>(subqry_alias.into()),
+            name,
+        )),
         _ => {
             let scalar_column = scalar_expr.display_name()?;
-            Ok(Column::new(Some(subqry_alias), scalar_column))
+            Ok(Column::new(
+                Some::<TableReference>(subqry_alias.into()),
+                scalar_column,
+            ))
         }
     }
 }
@@ -182,7 +191,7 @@ pub fn unnormalize_cols(exprs: impl IntoIterator<Item = Expr>) -> Vec<Expr> {
 /// Recursively remove all the ['OuterReferenceColumn'] and return the inside Column
 /// in the expression tree.
 pub fn strip_outer_reference(expr: Expr) -> Expr {
-    expr.transform(&|expr| {
+    expr.transform(|expr| {
         Ok({
             if let Expr::OuterReferenceColumn(_, col) = expr {
                 Transformed::yes(Expr::Column(col))
@@ -210,16 +219,10 @@ pub fn coerce_plan_expr_for_schema(
             Ok(LogicalPlan::Projection(projection))
         }
         _ => {
-            let exprs: Vec<Expr> = plan
-                .schema()
-                .iter()
-                .map(|(qualifier, field)| {
-                    Expr::Column(Column::from((qualifier, field.as_ref())))
-                })
-                .collect();
+            let exprs: Vec<Expr> = plan.schema().iter().map(Expr::from).collect();
 
             let new_exprs = coerce_exprs_for_schema(exprs, plan.schema(), schema)?;
-            let add_project = new_exprs.iter().any(|expr| expr.try_into_col().is_err());
+            let add_project = new_exprs.iter().any(|expr| expr.try_as_col().is_none());
             if add_project {
                 let projection = Projection::try_new(new_exprs, Arc::new(plan.clone()))?;
                 Ok(LogicalPlan::Projection(projection))
@@ -248,7 +251,7 @@ fn coerce_exprs_for_schema(
                     _ => expr.cast_to(new_type, src_schema),
                 }
             } else {
-                Ok(expr.clone())
+                Ok(expr)
             }
         })
         .collect::<Result<_>>()
@@ -285,8 +288,7 @@ mod test {
     use crate::expr::Sort;
     use crate::{col, lit, Cast};
     use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion_common::tree_node::{TreeNode, TreeNodeRewriter};
-    use datafusion_common::{DFSchema, OwnedTableReference, ScalarValue};
+    use datafusion_common::ScalarValue;
 
     #[derive(Default)]
     struct RecordingRewriter {
@@ -328,7 +330,7 @@ mod test {
         // rewrites "foo" --> "bar"
         let rewritten = col("state")
             .eq(lit("foo"))
-            .transform(&transformer)
+            .transform(transformer)
             .data()
             .unwrap();
         assert_eq!(rewritten, col("state").eq(lit("bar")));
@@ -336,7 +338,7 @@ mod test {
         // doesn't rewrite
         let rewritten = col("state")
             .eq(lit("baz"))
-            .transform(&transformer)
+            .transform(transformer)
             .data()
             .unwrap();
         assert_eq!(rewritten, col("state").eq(lit("baz")));
@@ -401,7 +403,7 @@ mod test {
     }
 
     fn make_schema_with_empty_metadata(
-        qualifiers: Vec<Option<OwnedTableReference>>,
+        qualifiers: Vec<Option<TableReference>>,
         fields: Vec<&str>,
     ) -> DFSchema {
         let fields = fields

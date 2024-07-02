@@ -18,8 +18,8 @@
 //! [`WindowUDF`]: User Defined Window Functions
 
 use crate::{
-    Expr, PartitionEvaluator, PartitionEvaluatorFactory, ReturnTypeFunction, Signature,
-    WindowFrame,
+    function::WindowFunctionSimplification, Expr, PartitionEvaluator,
+    PartitionEvaluatorFactory, ReturnTypeFunction, Signature, WindowFrame,
 };
 use arrow::datatypes::DataType;
 use datafusion_common::Result;
@@ -46,8 +46,8 @@ use std::{
 ///
 /// [`PartitionEvaluator`]: crate::PartitionEvaluator
 /// [`create_udwf`]: crate::expr_fn::create_udwf
-/// [`simple_udwf.rs`]: https://github.com/apache/arrow-datafusion/blob/main/datafusion-examples/examples/simple_udwf.rs
-/// [`advanced_udwf.rs`]: https://github.com/apache/arrow-datafusion/blob/main/datafusion-examples/examples/advanced_udwf.rs
+/// [`simple_udwf.rs`]: https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/simple_udwf.rs
+/// [`advanced_udwf.rs`]: https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/advanced_udwf.rs
 #[derive(Debug, Clone)]
 pub struct WindowUDF {
     inner: Arc<dyn WindowUDFImpl>,
@@ -108,8 +108,8 @@ impl WindowUDF {
     }
 
     /// Return the underlying [`WindowUDFImpl`] trait object for this function
-    pub fn inner(&self) -> Arc<dyn WindowUDFImpl> {
-        self.inner.clone()
+    pub fn inner(&self) -> &Arc<dyn WindowUDFImpl> {
+        &self.inner
     }
 
     /// Adds additional names that can be used to invoke this function, in
@@ -170,6 +170,13 @@ impl WindowUDF {
         self.inner.return_type(args)
     }
 
+    /// Do the function rewrite
+    ///
+    /// See [`WindowUDFImpl::simplify`] for more details.
+    pub fn simplify(&self) -> Option<WindowFunctionSimplification> {
+        self.inner.simplify()
+    }
+
     /// Return a `PartitionEvaluator` for evaluating this window function
     pub fn partition_evaluator_factory(&self) -> Result<Box<dyn PartitionEvaluator>> {
         self.inner.partition_evaluator()
@@ -194,7 +201,7 @@ where
 /// [`WindowUDF`] for other available options.
 ///
 ///
-/// [`advanced_udwf.rs`]: https://github.com/apache/arrow-datafusion/blob/main/datafusion-examples/examples/advanced_udwf.rs
+/// [`advanced_udwf.rs`]: https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/advanced_udwf.rs
 /// # Basic Example
 /// ```
 /// # use std::any::Any;
@@ -266,6 +273,29 @@ pub trait WindowUDFImpl: Debug + Send + Sync {
     fn aliases(&self) -> &[String] {
         &[]
     }
+
+    /// Optionally apply per-UDWF simplification / rewrite rules.
+    ///
+    /// This can be used to apply function specific simplification rules during
+    /// optimization. The default implementation does nothing.
+    ///
+    /// Note that DataFusion handles simplifying arguments and  "constant
+    /// folding" (replacing a function call with constant arguments such as
+    /// `my_add(1,2) --> 3` ). Thus, there is no need to implement such
+    /// optimizations manually for specific UDFs.
+    ///
+    /// Example:
+    /// [`simplify_udwf_expression.rs`]: <https://github.com/apache/arrow-datafusion/blob/main/datafusion-examples/examples/simplify_udwf_expression.rs>
+    ///
+    /// # Returns
+    /// [None] if simplify is not defined or,
+    ///
+    /// Or, a closure with two arguments:
+    /// * 'window_function': [crate::expr::WindowFunction] for which simplified has been invoked
+    /// * 'info': [crate::simplify::SimplifyInfo]
+    fn simplify(&self) -> Option<WindowFunctionSimplification> {
+        None
+    }
 }
 
 /// WindowUDF that adds an alias to the underlying function. It is better to
@@ -315,7 +345,7 @@ impl WindowUDFImpl for AliasedWindowUDFImpl {
 }
 
 /// Implementation of [`WindowUDFImpl`] that wraps the function style pointers
-/// of the older API (see <https://github.com/apache/arrow-datafusion/pull/8719>
+/// of the older API (see <https://github.com/apache/datafusion/pull/8719>
 /// for more details)
 pub struct WindowUDFLegacyWrapper {
     /// name

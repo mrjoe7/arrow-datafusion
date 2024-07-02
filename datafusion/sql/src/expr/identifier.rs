@@ -18,10 +18,10 @@
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
 use arrow_schema::Field;
 use datafusion_common::{
-    internal_err, plan_datafusion_err, Column, DFSchema, DataFusionError,
-    OwnedTableReference, Result, TableReference,
+    internal_err, plan_datafusion_err, Column, DFSchema, DataFusionError, Result,
+    ScalarValue, TableReference,
 };
-use datafusion_expr::{Case, Expr};
+use datafusion_expr::{expr::ScalarFunction, lit, Case, Expr};
 use sqlparser::ast::{Expr as SQLExpr, Ident};
 
 impl<'a, S: ContextProvider> SqlToRel<'a, S> {
@@ -133,7 +133,18 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                         );
                     }
                     let nested_name = nested_names[0].to_string();
-                    Ok(Expr::Column(Column::from((qualifier, field))).field(nested_name))
+
+                    let col = Expr::Column(Column::from((qualifier, field)));
+                    if let Some(udf) =
+                        self.context_provider.get_function_meta("get_field")
+                    {
+                        Ok(Expr::ScalarFunction(ScalarFunction::new_udf(
+                            udf,
+                            vec![col, lit(ScalarValue::from(nested_name))],
+                        )))
+                    } else {
+                        internal_err!("get_field not found")
+                    }
                 }
                 // found matching field with no spare identifier(s)
                 Some((field, qualifier, _nested_names)) => {
@@ -173,8 +184,6 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                                     // safe unwrap as s can never be empty or exceed the bounds
                                     let (relation, column_name) =
                                         form_identifier(s).unwrap();
-                                    let relation =
-                                        relation.map(|r| r.to_owned_reference());
                                     Ok(Expr::Column(Column::new(relation, column_name)))
                                 }
                             }
@@ -182,7 +191,6 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                             let s = &ids[0..ids.len()];
                             // safe unwrap as s can never be empty or exceed the bounds
                             let (relation, column_name) = form_identifier(s).unwrap();
-                            let relation = relation.map(|r| r.to_owned_reference());
                             Ok(Expr::Column(Column::new(relation, column_name)))
                         }
                     }
@@ -273,7 +281,7 @@ fn search_dfschema<'ids, 'schema>(
     schema: &'schema DFSchema,
 ) -> Option<(
     &'schema Field,
-    Option<&'schema OwnedTableReference>,
+    Option<&'schema TableReference>,
     &'ids [String],
 )> {
     generate_schema_search_terms(ids).find_map(|(qualifier, column, nested_names)| {

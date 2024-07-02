@@ -17,11 +17,11 @@
 
 //! Column
 
-use arrow_schema::Field;
+use arrow_schema::{Field, FieldRef};
 
 use crate::error::_schema_err;
 use crate::utils::{parse_identifiers_normalized, quote_identifier};
-use crate::{DFSchema, DataFusionError, OwnedTableReference, Result, SchemaError};
+use crate::{DFSchema, DataFusionError, Result, SchemaError, TableReference};
 use std::collections::HashSet;
 use std::convert::Infallible;
 use std::fmt;
@@ -32,7 +32,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Column {
     /// relation/table reference.
-    pub relation: Option<OwnedTableReference>,
+    pub relation: Option<TableReference>,
     /// field/column name.
     pub name: String,
 }
@@ -45,7 +45,7 @@ impl Column {
     ///
     /// [`TableReference::parse_str`]: crate::TableReference::parse_str
     pub fn new(
-        relation: Option<impl Into<OwnedTableReference>>,
+        relation: Option<impl Into<TableReference>>,
         name: impl Into<String>,
     ) -> Self {
         Self {
@@ -63,6 +63,8 @@ impl Column {
     }
 
     /// Create Column from unqualified name.
+    ///
+    /// Alias for `Column::new_unqualified`
     pub fn from_name(name: impl Into<String>) -> Self {
         Self {
             relation: None,
@@ -74,20 +76,20 @@ impl Column {
         let (relation, name) = match idents.len() {
             1 => (None, idents.remove(0)),
             2 => (
-                Some(OwnedTableReference::Bare {
+                Some(TableReference::Bare {
                     table: idents.remove(0).into(),
                 }),
                 idents.remove(0),
             ),
             3 => (
-                Some(OwnedTableReference::Partial {
+                Some(TableReference::Partial {
                     schema: idents.remove(0).into(),
                     table: idents.remove(0).into(),
                 }),
                 idents.remove(0),
             ),
             4 => (
-                Some(OwnedTableReference::Full {
+                Some(TableReference::Full {
                     catalog: idents.remove(0).into(),
                     schema: idents.remove(0).into(),
                     table: idents.remove(0).into(),
@@ -107,22 +109,29 @@ impl Column {
     /// `foo.BAR` would be parsed to a reference to relation `foo`, column name `bar` (lower case)
     /// where `"foo.BAR"` would be parsed to a reference to column named `foo.BAR`
     pub fn from_qualified_name(flat_name: impl Into<String>) -> Self {
-        let flat_name: &str = &flat_name.into();
-        Self::from_idents(&mut parse_identifiers_normalized(flat_name, false))
+        let flat_name = flat_name.into();
+        Self::from_idents(&mut parse_identifiers_normalized(&flat_name, false))
             .unwrap_or_else(|| Self {
                 relation: None,
-                name: flat_name.to_owned(),
+                name: flat_name,
             })
     }
 
     /// Deserialize a fully qualified name string into a column preserving column text case
     pub fn from_qualified_name_ignore_case(flat_name: impl Into<String>) -> Self {
-        let flat_name: &str = &flat_name.into();
-        Self::from_idents(&mut parse_identifiers_normalized(flat_name, true))
+        let flat_name = flat_name.into();
+        Self::from_idents(&mut parse_identifiers_normalized(&flat_name, true))
             .unwrap_or_else(|| Self {
                 relation: None,
-                name: flat_name.to_owned(),
+                name: flat_name,
             })
+    }
+
+    /// return the column's name.
+    ///
+    /// Note: This ignores the relation and returns the column name only.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     /// Serialize column into a flat name string
@@ -340,8 +349,15 @@ impl From<String> for Column {
 }
 
 /// Create a column, use qualifier and field name
-impl From<(Option<&OwnedTableReference>, &Field)> for Column {
-    fn from((relation, field): (Option<&OwnedTableReference>, &Field)) -> Self {
+impl From<(Option<&TableReference>, &Field)> for Column {
+    fn from((relation, field): (Option<&TableReference>, &Field)) -> Self {
+        Self::new(relation.cloned(), field.name())
+    }
+}
+
+/// Create a column, use qualifier and field name
+impl From<(Option<&TableReference>, &FieldRef)> for Column {
+    fn from((relation, field): (Option<&TableReference>, &FieldRef)) -> Self {
         Self::new(relation.cloned(), field.name())
     }
 }
@@ -364,7 +380,7 @@ impl fmt::Display for Column {
 mod tests {
     use super::*;
     use arrow::datatypes::DataType;
-    use arrow_schema::{Field, SchemaBuilder};
+    use arrow_schema::SchemaBuilder;
 
     fn create_qualified_schema(qualifier: &str, names: Vec<&str>) -> Result<DFSchema> {
         let mut schema_builder = SchemaBuilder::new();

@@ -25,10 +25,7 @@ use std::{
 use crate::{Expr, LogicalPlan, Volatility};
 
 use arrow::datatypes::DataType;
-use datafusion_common::parsers::CompressionTypeVariant;
-use datafusion_common::{
-    Constraints, DFSchemaRef, OwnedSchemaReference, OwnedTableReference,
-};
+use datafusion_common::{Constraints, DFSchemaRef, SchemaReference, TableReference};
 use sqlparser::ast::Ident;
 
 /// Various types of DDL  (CREATE / DROP) catalog manipulation
@@ -187,15 +184,11 @@ pub struct CreateExternalTable {
     /// The table schema
     pub schema: DFSchemaRef,
     /// The table name
-    pub name: OwnedTableReference,
+    pub name: TableReference,
     /// The physical location
     pub location: String,
     /// The file type of physical file
     pub file_type: String,
-    /// Whether the CSV file contains a header
-    pub has_header: bool,
-    /// Delimiter for CSV
-    pub delimiter: char,
     /// Partition Columns
     pub table_partition_cols: Vec<String>,
     /// Option to not error if table already exists
@@ -204,8 +197,6 @@ pub struct CreateExternalTable {
     pub definition: Option<String>,
     /// Order expressions supplied by user
     pub order_exprs: Vec<Vec<Expr>>,
-    /// File compression type (GZIP, BZIP2, XZ, ZSTD)
-    pub file_compression_type: CompressionTypeVariant,
     /// Whether the table is an infinite streams
     pub unbounded: bool,
     /// Table(provider) specific options
@@ -223,12 +214,9 @@ impl Hash for CreateExternalTable {
         self.name.hash(state);
         self.location.hash(state);
         self.file_type.hash(state);
-        self.has_header.hash(state);
-        self.delimiter.hash(state);
         self.table_partition_cols.hash(state);
         self.if_not_exists.hash(state);
         self.definition.hash(state);
-        self.file_compression_type.hash(state);
         self.order_exprs.hash(state);
         self.unbounded.hash(state);
         self.options.len().hash(state); // HashMap is not hashable
@@ -239,7 +227,7 @@ impl Hash for CreateExternalTable {
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct CreateMemoryTable {
     /// The table name
-    pub name: OwnedTableReference,
+    pub name: TableReference,
     /// The list of constraints in the schema, such as primary key, unique, etc.
     pub constraints: Constraints,
     /// The logical plan
@@ -256,7 +244,7 @@ pub struct CreateMemoryTable {
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct CreateView {
     /// The table name
-    pub name: OwnedTableReference,
+    pub name: TableReference,
     /// The logical plan
     pub input: Arc<LogicalPlan>,
     /// Option to not error if table already exists
@@ -291,7 +279,7 @@ pub struct CreateCatalogSchema {
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct DropTable {
     /// The table name
-    pub name: OwnedTableReference,
+    pub name: TableReference,
     /// If the table exists
     pub if_exists: bool,
     /// Dummy schema
@@ -302,7 +290,7 @@ pub struct DropTable {
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct DropView {
     /// The view name
-    pub name: OwnedTableReference,
+    pub name: TableReference,
     /// If the view exists
     pub if_exists: bool,
     /// Dummy schema
@@ -313,7 +301,7 @@ pub struct DropView {
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct DropCatalogSchema {
     /// The schema name
-    pub name: OwnedSchemaReference,
+    pub name: SchemaReference,
     /// If the schema exists
     pub if_exists: bool,
     /// Whether drop should cascade
@@ -353,29 +341,8 @@ pub struct CreateFunctionBody {
     pub language: Option<Ident>,
     /// IMMUTABLE | STABLE | VOLATILE
     pub behavior: Option<Volatility>,
-    /// AS 'definition'
-    pub as_: Option<DefinitionStatement>,
-    /// RETURN expression
-    pub return_: Option<Expr>,
-}
-
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub enum DefinitionStatement {
-    SingleQuotedDef(String),
-    DoubleDollarDef(String),
-}
-
-impl From<sqlparser::ast::FunctionDefinition> for DefinitionStatement {
-    fn from(value: sqlparser::ast::FunctionDefinition) -> Self {
-        match value {
-            sqlparser::ast::FunctionDefinition::SingleQuotedDef(s) => {
-                Self::SingleQuotedDef(s)
-            }
-            sqlparser::ast::FunctionDefinition::DoubleDollarDef(s) => {
-                Self::DoubleDollarDef(s)
-            }
-        }
-    }
+    /// RETURN or AS function body
+    pub function_body: Option<Expr>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]

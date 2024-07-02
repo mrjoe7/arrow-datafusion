@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use rstest::rstest;
 
 use datafusion::config::ConfigOptions;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
@@ -80,7 +81,7 @@ async fn explain_analyze_baseline_metrics() {
     );
     assert_metrics!(
         &formatted,
-        "ProjectionExec: expr=[COUNT(*)",
+        "ProjectionExec: expr=[count(*)",
         "metrics=[output_rows=1, elapsed_compute="
     );
     assert_metrics!(
@@ -566,27 +567,28 @@ async fn csv_explain_verbose_plans() {
     assert_contains!(actual, "ProjectionExec: expr=[c1@0 as c1]");
 }
 
+#[rstest]
 #[tokio::test]
-async fn explain_analyze_runs_optimizers() {
-    // repro for https://github.com/apache/arrow-datafusion/issues/917
+async fn explain_analyze_runs_optimizers(#[values("*", "1")] count_expr: &str) {
+    // repro for https://github.com/apache/datafusion/issues/917
     // where EXPLAIN ANALYZE was not correctly running optiimizer
     let ctx = SessionContext::new();
     register_alltypes_parquet(&ctx).await;
 
-    // This happens as an optimization pass where count(*) can be
+    // This happens as an optimization pass where count(*)/count(1) can be
     // answered using statistics only.
     let expected = "PlaceholderRowExec";
 
-    let sql = "EXPLAIN SELECT count(*) from alltypes_plain";
-    let actual = execute_to_batches(&ctx, sql).await;
+    let sql = format!("EXPLAIN SELECT count({count_expr}) from alltypes_plain");
+    let actual = execute_to_batches(&ctx, &sql).await;
     let actual = arrow::util::pretty::pretty_format_batches(&actual)
         .unwrap()
         .to_string();
     assert_contains!(actual, expected);
 
     // EXPLAIN ANALYZE should work the same
-    let sql = "EXPLAIN  ANALYZE SELECT count(*) from alltypes_plain";
-    let actual = execute_to_batches(&ctx, sql).await;
+    let sql = format!("EXPLAIN ANALYZE SELECT count({count_expr}) from alltypes_plain");
+    let actual = execute_to_batches(&ctx, &sql).await;
     let actual = arrow::util::pretty::pretty_format_batches(&actual)
         .unwrap()
         .to_string();
@@ -612,7 +614,7 @@ async fn test_physical_plan_display_indent() {
     let expected = vec![
         "GlobalLimitExec: skip=0, fetch=10",
         "  SortPreservingMergeExec: [the_min@2 DESC], fetch=10",
-        "    SortExec: TopK(fetch=10), expr=[the_min@2 DESC]",
+        "    SortExec: TopK(fetch=10), expr=[the_min@2 DESC], preserve_partitioning=[true]",
         "      ProjectionExec: expr=[c1@0 as c1, MAX(aggregate_test_100.c12)@1 as MAX(aggregate_test_100.c12), MIN(aggregate_test_100.c12)@2 as the_min]",
         "        AggregateExec: mode=FinalPartitioned, gby=[c1@0 as c1], aggr=[MAX(aggregate_test_100.c12), MIN(aggregate_test_100.c12)]",
         "          CoalesceBatchesExec: target_batch_size=4096",
@@ -698,7 +700,7 @@ async fn csv_explain_analyze() {
     // Only test basic plumbing and try to avoid having to change too
     // many things. explain_analyze_baseline_metrics covers the values
     // in greater depth
-    let needle = "AggregateExec: mode=FinalPartitioned, gby=[c1@0 as c1], aggr=[COUNT(*)], metrics=[output_rows=5";
+    let needle = "AggregateExec: mode=FinalPartitioned, gby=[c1@0 as c1], aggr=[count(*)], metrics=[output_rows=5";
     assert_contains!(&formatted, needle);
 
     let verbose_needle = "Output Rows";
@@ -717,9 +719,9 @@ async fn csv_explain_analyze_order_by() {
         .to_string();
 
     // Ensure that the ordering is not optimized away from the plan
-    // https://github.com/apache/arrow-datafusion/issues/6379
+    // https://github.com/apache/datafusion/issues/6379
     let needle =
-        "SortExec: expr=[c1@0 ASC NULLS LAST], metrics=[output_rows=100, elapsed_compute";
+        "SortExec: expr=[c1@0 ASC NULLS LAST], preserve_partitioning=[false], metrics=[output_rows=100, elapsed_compute";
     assert_contains!(&formatted, needle);
 }
 
@@ -791,7 +793,7 @@ async fn explain_logical_plan_only() {
     let expected = vec![
         vec![
             "logical_plan",
-            "Aggregate: groupBy=[[]], aggr=[[COUNT(UInt8(1)) AS COUNT(*)]]\
+            "Aggregate: groupBy=[[]], aggr=[[count(Int64(1)) AS count(*)]]\
             \n  SubqueryAlias: t\
             \n    Projection: \
             \n      Values: (Utf8(\"a\"), Int64(1), Int64(100)), (Utf8(\"a\"), Int64(2), Int64(150))"
@@ -810,7 +812,7 @@ async fn explain_physical_plan_only() {
 
     let expected = vec![vec![
         "physical_plan",
-        "ProjectionExec: expr=[2 as COUNT(*)]\
+        "ProjectionExec: expr=[2 as count(*)]\
         \n  PlaceholderRowExec\
         \n",
     ]];

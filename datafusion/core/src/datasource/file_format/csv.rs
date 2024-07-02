@@ -18,12 +18,12 @@
 //! [`CsvFormat`], Comma Separated Value (CSV) [`FileFormat`] abstractions
 
 use std::any::Any;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug};
 use std::sync::Arc;
 
 use super::write::orchestration::stateless_multipart_put;
-use super::FileFormat;
+use super::{FileFormat, FileFormatFactory};
 use crate::datasource::file_format::file_compression_type::FileCompressionType;
 use crate::datasource::file_format::write::BatchSerializer;
 use crate::datasource::physical_plan::{
@@ -31,17 +31,20 @@ use crate::datasource::physical_plan::{
 };
 use crate::error::Result;
 use crate::execution::context::SessionState;
-use crate::physical_plan::insert::{DataSink, FileSinkExec};
-use crate::physical_plan::{DisplayAs, DisplayFormatType, Statistics};
-use crate::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
+use crate::physical_plan::insert::{DataSink, DataSinkExec};
+use crate::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream, Statistics,
+};
 
 use arrow::array::RecordBatch;
 use arrow::csv::WriterBuilder;
+use arrow::datatypes::SchemaRef;
 use arrow::datatypes::{DataType, Field, Fields, Schema};
-use arrow::{self, datatypes::SchemaRef};
-use datafusion_common::config::CsvOptions;
+use datafusion_common::config::{ConfigField, ConfigFileType, CsvOptions};
 use datafusion_common::file_options::csv_writer::CsvWriterOptions;
-use datafusion_common::{exec_err, not_impl_err, DataFusionError, FileType};
+use datafusion_common::{
+    exec_err, not_impl_err, DataFusionError, GetExt, DEFAULT_CSV_EXTENSION,
+};
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::{PhysicalExpr, PhysicalSortRequirement};
 use datafusion_physical_plan::metrics::MetricsSet;
@@ -51,6 +54,63 @@ use bytes::{Buf, Bytes};
 use futures::stream::BoxStream;
 use futures::{pin_mut, Stream, StreamExt, TryStreamExt};
 use object_store::{delimited::newline_delimited_stream, ObjectMeta, ObjectStore};
+
+#[derive(Default)]
+/// Factory struct used to create [CsvFormatFactory]
+pub struct CsvFormatFactory {
+    options: Option<CsvOptions>,
+}
+
+impl CsvFormatFactory {
+    /// Creates an instance of [CsvFormatFactory]
+    pub fn new() -> Self {
+        Self { options: None }
+    }
+
+    /// Creates an instance of [CsvFormatFactory] with customized default options
+    pub fn new_with_options(options: CsvOptions) -> Self {
+        Self {
+            options: Some(options),
+        }
+    }
+}
+
+impl FileFormatFactory for CsvFormatFactory {
+    fn create(
+        &self,
+        state: &SessionState,
+        format_options: &HashMap<String, String>,
+    ) -> Result<Arc<dyn FileFormat>> {
+        let csv_options = match &self.options {
+            None => {
+                let mut table_options = state.default_table_options();
+                table_options.set_config_format(ConfigFileType::CSV);
+                table_options.alter_with_string_hash_map(format_options)?;
+                table_options.csv
+            }
+            Some(csv_options) => {
+                let mut csv_options = csv_options.clone();
+                for (k, v) in format_options {
+                    csv_options.set(k, v)?;
+                }
+                csv_options
+            }
+        };
+
+        Ok(Arc::new(CsvFormat::default().with_options(csv_options)))
+    }
+
+    fn default(&self) -> Arc<dyn FileFormat> {
+        Arc::new(CsvFormat::default())
+    }
+}
+
+impl GetExt for CsvFormatFactory {
+    fn get_ext(&self) -> String {
+        // Removes the dot, i.e. ".parquet" -> "parquet"
+        DEFAULT_CSV_EXTENSION[1..].to_string()
+    }
+}
 
 /// Character Separated Value `FileFormat` implementation.
 #[derive(Debug, Default)]
@@ -136,13 +196,20 @@ impl CsvFormat {
     /// Set true to indicate that the first line is a header.
     /// - default to true
     pub fn with_has_header(mut self, has_header: bool) -> Self {
-        self.options.has_header = has_header;
+        self.options.has_header = Some(has_header);
         self
     }
 
-    /// True if the first line is a header.
-    pub fn has_header(&self) -> bool {
+    /// Returns `Some(true)` if the first line is a header, `Some(false)` if
+    /// it is not, and `None` if it is not specified.
+    pub fn has_header(&self) -> Option<bool> {
         self.options.has_header
+    }
+
+    /// Lines beginning with this byte are ignored.
+    pub fn with_comment(mut self, comment: Option<u8>) -> Self {
+        self.options.comment = comment;
+        self
     }
 
     /// The character separating values within a row.
@@ -198,9 +265,21 @@ impl FileFormat for CsvFormat {
         self
     }
 
+    fn get_ext(&self) -> String {
+        CsvFormatFactory::new().get_ext()
+    }
+
+    fn get_ext_with_compression(
+        &self,
+        file_compression_type: &FileCompressionType,
+    ) -> Result<String> {
+        let ext = self.get_ext();
+        Ok(format!("{}{}", ext, file_compression_type.get_ext()))
+    }
+
     async fn infer_schema(
         &self,
-        _state: &SessionState,
+        state: &SessionState,
         store: &Arc<dyn ObjectStore>,
         objects: &[ObjectMeta],
     ) -> Result<SchemaRef> {
@@ -211,7 +290,7 @@ impl FileFormat for CsvFormat {
         for object in objects {
             let stream = self.read_to_delimited_chunks(store, object).await;
             let (schema, records_read) = self
-                .infer_schema_from_stream(records_to_read, stream)
+                .infer_schema_from_stream(state, records_to_read, stream)
                 .await?;
             records_to_read -= records_read;
             schemas.push(schema);
@@ -236,16 +315,21 @@ impl FileFormat for CsvFormat {
 
     async fn create_physical_plan(
         &self,
-        _state: &SessionState,
+        state: &SessionState,
         conf: FileScanConfig,
         _filters: Option<&Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let exec = CsvExec::new(
             conf,
-            self.options.has_header,
+            // If format options does not specify whether there is a header,
+            // we consult configuration options.
+            self.options
+                .has_header
+                .unwrap_or(state.config_options().catalog.has_header),
             self.options.delimiter,
             self.options.quote,
             self.options.escape,
+            self.options.comment,
             self.options.compression.into(),
         );
         Ok(Arc::new(exec))
@@ -267,16 +351,12 @@ impl FileFormat for CsvFormat {
         let sink_schema = conf.output_schema().clone();
         let sink = Arc::new(CsvSink::new(conf, writer_options));
 
-        Ok(Arc::new(FileSinkExec::new(
+        Ok(Arc::new(DataSinkExec::new(
             input,
             sink,
             sink_schema,
             order_requirements,
         )) as _)
-    }
-
-    fn file_type(&self) -> FileType {
-        FileType::CSV
     }
 }
 
@@ -286,6 +366,7 @@ impl CsvFormat {
     /// number of lines that were read
     async fn infer_schema_from_stream(
         &self,
+        state: &SessionState,
         mut records_to_read: usize,
         stream: impl Stream<Item = Result<Bytes>>,
     ) -> Result<(Schema, usize)> {
@@ -297,9 +378,19 @@ impl CsvFormat {
         pin_mut!(stream);
 
         while let Some(chunk) = stream.next().await.transpose()? {
-            let format = arrow::csv::reader::Format::default()
-                .with_header(self.options.has_header && first_chunk)
+            let mut format = arrow::csv::reader::Format::default()
+                .with_header(
+                    first_chunk
+                        && self
+                            .options
+                            .has_header
+                            .unwrap_or(state.config_options().catalog.has_header),
+                )
                 .with_delimiter(self.options.delimiter);
+
+            if let Some(comment) = self.options.comment {
+                format = format.with_comment(comment);
+            }
 
             let (Schema { fields, .. }, records_read) =
                 format.infer_schema(chunk.reader(), Some(records_to_read))?;
@@ -536,13 +627,12 @@ mod tests {
 
     use arrow::compute::concat_batches;
     use datafusion_common::cast::as_string_array;
+    use datafusion_common::internal_err;
     use datafusion_common::stats::Precision;
-    use datafusion_common::{internal_err, FileType, GetExt};
+    use datafusion_execution::runtime_env::{RuntimeConfig, RuntimeEnv};
     use datafusion_expr::{col, lit};
 
-    use bytes::Bytes;
     use chrono::DateTime;
-    use futures::StreamExt;
     use object_store::local::LocalFileSystem;
     use object_store::path::Path;
     use regex::Regex;
@@ -556,7 +646,8 @@ mod tests {
         let task_ctx = state.task_ctx();
         // skip column 9 that overflows the automaticly discovered column type of i64 (u64 would work)
         let projection = Some(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12]);
-        let exec = get_exec(&state, "aggregate_test_100.csv", projection, None).await?;
+        let exec =
+            get_exec(&state, "aggregate_test_100.csv", projection, None, true).await?;
         let stream = exec.execute(0, task_ctx)?;
 
         let tt_batches: i32 = stream
@@ -584,7 +675,7 @@ mod tests {
         let task_ctx = session_ctx.task_ctx();
         let projection = Some(vec![0, 1, 2, 3]);
         let exec =
-            get_exec(&state, "aggregate_test_100.csv", projection, Some(1)).await?;
+            get_exec(&state, "aggregate_test_100.csv", projection, Some(1), true).await?;
         let batches = collect(exec, task_ctx).await?;
         assert_eq!(1, batches.len());
         assert_eq!(4, batches[0].num_columns());
@@ -599,7 +690,8 @@ mod tests {
         let state = session_ctx.state();
 
         let projection = None;
-        let exec = get_exec(&state, "aggregate_test_100.csv", projection, None).await?;
+        let exec =
+            get_exec(&state, "aggregate_test_100.csv", projection, None, true).await?;
 
         let x: Vec<String> = exec
             .schema()
@@ -635,7 +727,8 @@ mod tests {
         let state = session_ctx.state();
         let task_ctx = session_ctx.task_ctx();
         let projection = Some(vec![0]);
-        let exec = get_exec(&state, "aggregate_test_100.csv", projection, None).await?;
+        let exec =
+            get_exec(&state, "aggregate_test_100.csv", projection, None, true).await?;
 
         let batches = collect(exec, task_ctx).await.expect("Collect batches");
 
@@ -718,8 +811,11 @@ mod tests {
     async fn query_compress_data(
         file_compression_type: FileCompressionType,
     ) -> Result<()> {
+        let runtime = Arc::new(RuntimeEnv::new(RuntimeConfig::new()).unwrap());
+        let mut cfg = SessionConfig::new();
+        cfg.options_mut().catalog.has_header = true;
+        let session_state = SessionState::new_with_config_rt(cfg, runtime);
         let integration = LocalFileSystem::new_with_prefix(arrow_test_data()).unwrap();
-
         let path = Path::from("csv/aggregate_test_100.csv");
         let csv = CsvFormat::default().with_has_header(true);
         let records_to_read = csv.options().schema_infer_max_rec;
@@ -759,7 +855,7 @@ mod tests {
             .read_to_delimited_chunks_from_stream(compressed_stream.unwrap())
             .await;
         let (schema, records_read) = compressed_csv
-            .infer_schema_from_stream(records_to_read, decoded_stream)
+            .infer_schema_from_stream(&session_state, records_to_read, decoded_stream)
             .await?;
 
         assert_eq!(expected, schema);
@@ -805,9 +901,10 @@ mod tests {
         file_name: &str,
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
+        has_header: bool,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let root = format!("{}/csv", crate::test_util::arrow_test_data());
-        let format = CsvFormat::default();
+        let format = CsvFormat::default().with_has_header(has_header);
         scan_format(state, &format, &root, file_name, projection, limit).await
     }
 
@@ -903,7 +1000,7 @@ mod tests {
 
         #[rustfmt::skip]
         let expected = ["+--------------+",
-            "| SUM(aggr.c2) |",
+            "| sum(aggr.c2) |",
             "+--------------+",
             "| 285          |",
             "+--------------+"];
@@ -940,7 +1037,7 @@ mod tests {
 
         #[rustfmt::skip]
         let expected = ["+--------------+",
-            "| SUM(aggr.c3) |",
+            "| sum(aggr.c3) |",
             "+--------------+",
             "| 781          |",
             "+--------------+"];
@@ -1033,9 +1130,9 @@ mod tests {
             .with_repartition_file_min_size(0)
             .with_target_partitions(n_partitions);
         let ctx = SessionContext::new_with_config(config);
-        let file_format = CsvFormat::default().with_has_header(false);
-        let listing_options = ListingOptions::new(Arc::new(file_format))
-            .with_file_extension(FileType::CSV.get_ext());
+        let file_format = Arc::new(CsvFormat::default().with_has_header(false));
+        let listing_options = ListingOptions::new(file_format.clone())
+            .with_file_extension(file_format.get_ext());
         ctx.register_listing_table(
             "empty",
             "tests/data/empty_files/all_empty/",
@@ -1086,9 +1183,9 @@ mod tests {
             .with_repartition_file_min_size(0)
             .with_target_partitions(n_partitions);
         let ctx = SessionContext::new_with_config(config);
-        let file_format = CsvFormat::default().with_has_header(false);
-        let listing_options = ListingOptions::new(Arc::new(file_format))
-            .with_file_extension(FileType::CSV.get_ext());
+        let file_format = Arc::new(CsvFormat::default().with_has_header(false));
+        let listing_options = ListingOptions::new(file_format.clone())
+            .with_file_extension(file_format.get_ext());
         ctx.register_listing_table(
             "empty",
             "tests/data/empty_files/some_empty",
@@ -1106,7 +1203,7 @@ mod tests {
 
         #[rustfmt::skip]
         let expected = ["+---------------------+",
-            "| SUM(empty.column_1) |",
+            "| sum(empty.column_1) |",
             "+---------------------+",
             "| 10                  |",
             "+---------------------+"];
@@ -1145,7 +1242,7 @@ mod tests {
 
         #[rustfmt::skip]
         let expected = ["+-----------------------+",
-            "| SUM(one_col.column_1) |",
+            "| sum(one_col.column_1) |",
             "+-----------------------+",
             "| 50                    |",
             "+-----------------------+"];

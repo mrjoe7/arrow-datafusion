@@ -236,13 +236,14 @@ mod tests {
     fn setup_context() -> (SessionContext, Arc<dyn SchemaProvider>) {
         let mut ctx = SessionContext::new();
         ctx.register_catalog_list(Arc::new(DynamicFileCatalog::new(
-            ctx.state().catalog_list(),
+            ctx.state().catalog_list().clone(),
             ctx.state_weak_ref(),
         )));
 
-        let provider =
-            &DynamicFileCatalog::new(ctx.state().catalog_list(), ctx.state_weak_ref())
-                as &dyn CatalogProviderList;
+        let provider = &DynamicFileCatalog::new(
+            ctx.state().catalog_list().clone(),
+            ctx.state_weak_ref(),
+        ) as &dyn CatalogProviderList;
         let catalog = provider
             .catalog(provider.catalog_names().first().unwrap())
             .unwrap();
@@ -345,10 +346,9 @@ mod tests {
             if cfg!(windows) { "USERPROFILE" } else { "HOME" },
             test_home_path,
         );
-        let input =
-            "~/Code/arrow-datafusion/benchmarks/data/tpch_sf1/part/part-0.parquet";
+        let input = "~/Code/datafusion/benchmarks/data/tpch_sf1/part/part-0.parquet";
         let expected = format!(
-            "{}{}Code{}arrow-datafusion{}benchmarks{}data{}tpch_sf1{}part{}part-0.parquet",
+            "{}{}Code{}datafusion{}benchmarks{}data{}tpch_sf1{}part{}part-0.parquet",
             test_home_path,
             MAIN_SEPARATOR,
             MAIN_SEPARATOR,

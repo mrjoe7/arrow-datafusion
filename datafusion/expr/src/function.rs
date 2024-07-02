@@ -19,9 +19,17 @@
 
 use crate::ColumnarValue;
 use crate::{Accumulator, Expr, PartitionEvaluator};
-use arrow::datatypes::{DataType, Schema};
+use arrow::datatypes::{DataType, Field, Schema};
 use datafusion_common::Result;
 use std::sync::Arc;
+
+#[derive(Debug, Clone, Copy)]
+pub enum Hint {
+    /// Indicates the argument needs to be padded if it is scalar
+    Pad,
+    /// Indicates the argument can be converted to an array of length 1
+    AcceptsSingular,
+}
 
 /// Scalar function
 ///
@@ -38,35 +46,74 @@ pub type ScalarFunctionImplementation =
 pub type ReturnTypeFunction =
     Arc<dyn Fn(&[DataType]) -> Result<Arc<DataType>> + Send + Sync>;
 
-/// Arguments passed to create an accumulator
+/// [`AccumulatorArgs`] contains information about how an aggregate
+/// function was called, including the types of its arguments and any optional
+/// ordering expressions.
+#[derive(Debug)]
 pub struct AccumulatorArgs<'a> {
-    // default arguments
-    /// the return type of the function
+    /// The return type of the aggregate function.
     pub data_type: &'a DataType,
-    /// the schema of the input arguments
+
+    /// The schema of the input arguments
     pub schema: &'a Schema,
-    /// whether to ignore nulls
+
+    /// Whether to ignore nulls.
+    ///
+    /// SQL allows the user to specify `IGNORE NULLS`, for example:
+    ///
+    /// ```sql
+    /// SELECT FIRST_VALUE(column1) IGNORE NULLS FROM t;
+    /// ```
     pub ignore_nulls: bool,
 
-    // ordering arguments
-    /// the expressions of `order by`, if no ordering is required, this will be an empty slice
+    /// The expressions in the `ORDER BY` clause passed to this aggregator.
+    ///
+    /// SQL allows the user to specify the ordering of arguments to the
+    /// aggregate using an `ORDER BY`. For example:
+    ///
+    /// ```sql
+    /// SELECT FIRST_VALUE(column1 ORDER BY column2) FROM t;
+    /// ```
+    ///
+    /// If no `ORDER BY` is specified, `sort_exprs`` will be empty.
     pub sort_exprs: &'a [Expr],
+
+    /// The name of the aggregate expression
+    pub name: &'a str,
+
+    /// Whether the aggregate function is distinct.
+    ///
+    /// ```sql
+    /// SELECT COUNT(DISTINCT column1) FROM t;
+    /// ```
+    pub is_distinct: bool,
+
+    /// The input type of the aggregate function.
+    pub input_type: &'a DataType,
+
+    /// The logical expression of arguments the aggregate function takes.
+    pub input_exprs: &'a [Expr],
 }
 
-impl<'a> AccumulatorArgs<'a> {
-    pub fn new(
-        data_type: &'a DataType,
-        schema: &'a Schema,
-        ignore_nulls: bool,
-        sort_exprs: &'a [Expr],
-    ) -> Self {
-        Self {
-            data_type,
-            schema,
-            ignore_nulls,
-            sort_exprs,
-        }
-    }
+/// [`StateFieldsArgs`] contains information about the fields that an
+/// aggregate function's accumulator should have. Used for [`AggregateUDFImpl::state_fields`].
+///
+/// [`AggregateUDFImpl::state_fields`]: crate::udaf::AggregateUDFImpl::state_fields
+pub struct StateFieldsArgs<'a> {
+    /// The name of the aggregate function.
+    pub name: &'a str,
+
+    /// The input type of the aggregate function.
+    pub input_type: &'a DataType,
+
+    /// The return type of the aggregate function.
+    pub return_type: &'a DataType,
+
+    /// The ordering fields of the aggregate function.
+    pub ordering_fields: &'a [Field],
+
+    /// Whether the aggregate function is distinct.
+    pub is_distinct: bool,
 }
 
 /// Factory that returns an accumulator for the given aggregate function.
@@ -82,3 +129,29 @@ pub type PartitionEvaluatorFactory =
 /// its state, given its return datatype.
 pub type StateTypeFunction =
     Arc<dyn Fn(&DataType) -> Result<Arc<Vec<DataType>>> + Send + Sync>;
+
+/// [crate::udaf::AggregateUDFImpl::simplify] simplifier closure
+/// A closure with two arguments:
+/// * 'aggregate_function': [crate::expr::AggregateFunction] for which simplified has been invoked
+/// * 'info': [crate::simplify::SimplifyInfo]
+///
+/// closure returns simplified [Expr] or an error.
+pub type AggregateFunctionSimplification = Box<
+    dyn Fn(
+        crate::expr::AggregateFunction,
+        &dyn crate::simplify::SimplifyInfo,
+    ) -> Result<Expr>,
+>;
+
+/// [crate::udwf::WindowUDFImpl::simplify] simplifier closure
+/// A closure with two arguments:
+/// * 'window_function': [crate::expr::WindowFunction] for which simplified has been invoked
+/// * 'info': [crate::simplify::SimplifyInfo]
+///
+/// closure returns simplified [Expr] or an error.
+pub type WindowFunctionSimplification = Box<
+    dyn Fn(
+        crate::expr::WindowFunction,
+        &dyn crate::simplify::SimplifyInfo,
+    ) -> Result<Expr>,
+>;

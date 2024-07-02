@@ -20,7 +20,6 @@
 //!
 //! [`Expr`]: crate::prelude::Expr
 use std::collections::HashSet;
-use std::convert::TryFrom;
 use std::sync::Arc;
 
 use crate::{
@@ -105,19 +104,23 @@ pub trait PruningStatistics {
     fn num_containers(&self) -> usize;
 
     /// Return the number of null values for the named column as an
-    /// `Option<UInt64Array>`.
+    /// [`UInt64Array`]
     ///
     /// See [`Self::min_values`] for when to return `None` and null values.
     ///
     /// Note: the returned array must contain [`Self::num_containers`] rows
+    ///
+    /// [`UInt64Array`]: arrow::array::UInt64Array
     fn null_counts(&self, column: &Column) -> Option<ArrayRef>;
 
     /// Return the number of rows for the named column in each container
-    /// as an `Option<UInt64Array>`.
+    /// as an [`UInt64Array`].
     ///
     /// See [`Self::min_values`] for when to return `None` and null values.
     ///
     /// Note: the returned array must contain [`Self::num_containers`] rows
+    ///
+    /// [`UInt64Array`]: arrow::array::UInt64Array
     fn row_counts(&self, column: &Column) -> Option<ArrayRef>;
 
     /// Returns [`BooleanArray`] where each row represents information known
@@ -181,7 +184,7 @@ pub trait PruningStatistics {
 /// example of how to use `PruningPredicate` to prune files based on min/max
 /// values.
 ///
-/// [`pruning.rs` example in the `datafusion-examples`]: https://github.com/apache/arrow-datafusion/blob/main/datafusion-examples/examples/pruning.rs
+/// [`pruning.rs` example in the `datafusion-examples`]: https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/pruning.rs
 ///
 /// Given an expression like `x = 5` and statistics for 3 containers (Row
 /// Groups, files, etc) `A`, `B`, and `C`:
@@ -330,7 +333,8 @@ pub trait PruningStatistics {
 /// `x = 5` | `CASE WHEN x_null_count = x_row_count THEN false ELSE x_min <= 5 AND 5 <= x_max END`
 /// `x < 5` | `CASE WHEN x_null_count = x_row_count THEN false ELSE x_max < 5 END`
 /// `x = 5 AND y = 10` | `CASE WHEN x_null_count = x_row_count THEN false ELSE x_min <= 5 AND 5 <= x_max END AND CASE WHEN y_null_count = y_row_count THEN false ELSE y_min <= 10 AND 10 <= y_max END`
-/// `x IS NULL`  | `CASE WHEN x_null_count = x_row_count THEN false ELSE x_null_count > 0 END`
+/// `x IS NULL`  | `x_null_count > 0`
+/// `x IS NOT NULL`  | `x_null_count != row_count`
 /// `CAST(x as int) = 5` | `CASE WHEN x_null_count = x_row_count THEN false ELSE CAST(x_min as int) <= 5 AND 5 <= CAST(x_max as int) END`
 ///
 /// ## Predicate Evaluation
@@ -467,8 +471,10 @@ pub struct PruningPredicate {
     /// Original physical predicate from which this predicate expr is derived
     /// (required for serialization)
     orig_expr: Arc<dyn PhysicalExpr>,
-    /// [`LiteralGuarantee`]s that are used to try and prove a predicate can not
-    /// possibly evaluate to `true`.
+    /// [`LiteralGuarantee`]s used to try and prove a predicate can not possibly
+    /// evaluate to `true`.
+    ///
+    /// See [`PruningPredicate::literal_guarantees`] for more details.
     literal_guarantees: Vec<LiteralGuarantee>,
 }
 
@@ -591,6 +597,10 @@ impl PruningPredicate {
     }
 
     /// Returns a reference to the literal guarantees
+    ///
+    /// Note that **All** `LiteralGuarantee`s must be satisfied for the
+    /// expression to possibly be `true`. If any is not satisfied, the
+    /// expression is guaranteed to be `null` or `false`.
     pub fn literal_guarantees(&self) -> &[LiteralGuarantee] {
         &self.literal_guarantees
     }
@@ -768,11 +778,17 @@ impl RequiredColumns {
         column_expr: &Arc<dyn PhysicalExpr>,
         field: &Field,
         stat_type: StatisticsType,
-        suffix: &str,
     ) -> Result<Arc<dyn PhysicalExpr>> {
         let (idx, need_to_insert) = match self.find_stat_column(column, stat_type) {
             Some(idx) => (idx, false),
             None => (self.columns.len(), true),
+        };
+
+        let suffix = match stat_type {
+            StatisticsType::Min => "min",
+            StatisticsType::Max => "max",
+            StatisticsType::NullCount => "null_count",
+            StatisticsType::RowCount => "row_count",
         };
 
         let stat_column =
@@ -796,7 +812,7 @@ impl RequiredColumns {
         column_expr: &Arc<dyn PhysicalExpr>,
         field: &Field,
     ) -> Result<Arc<dyn PhysicalExpr>> {
-        self.stat_column_expr(column, column_expr, field, StatisticsType::Min, "min")
+        self.stat_column_expr(column, column_expr, field, StatisticsType::Min)
     }
 
     /// rewrite col --> col_max
@@ -806,7 +822,7 @@ impl RequiredColumns {
         column_expr: &Arc<dyn PhysicalExpr>,
         field: &Field,
     ) -> Result<Arc<dyn PhysicalExpr>> {
-        self.stat_column_expr(column, column_expr, field, StatisticsType::Max, "max")
+        self.stat_column_expr(column, column_expr, field, StatisticsType::Max)
     }
 
     /// rewrite col --> col_null_count
@@ -816,13 +832,7 @@ impl RequiredColumns {
         column_expr: &Arc<dyn PhysicalExpr>,
         field: &Field,
     ) -> Result<Arc<dyn PhysicalExpr>> {
-        self.stat_column_expr(
-            column,
-            column_expr,
-            field,
-            StatisticsType::NullCount,
-            "null_count",
-        )
+        self.stat_column_expr(column, column_expr, field, StatisticsType::NullCount)
     }
 
     /// rewrite col --> col_row_count
@@ -832,13 +842,7 @@ impl RequiredColumns {
         column_expr: &Arc<dyn PhysicalExpr>,
         field: &Field,
     ) -> Result<Arc<dyn PhysicalExpr>> {
-        self.stat_column_expr(
-            column,
-            column_expr,
-            field,
-            StatisticsType::RowCount,
-            "row_count",
-        )
+        self.stat_column_expr(column, column_expr, field, StatisticsType::RowCount)
     }
 }
 
@@ -983,8 +987,8 @@ impl<'a> PruningExpressionBuilder<'a> {
         })
     }
 
-    fn op(&self) -> Operator {
-        self.op
+    fn op(&self) -> &Operator {
+        &self.op
     }
 
     fn scalar_expr(&self) -> &Arc<dyn PhysicalExpr> {
@@ -1060,7 +1064,7 @@ fn rewrite_expr_to_prunable(
     scalar_expr: &PhysicalExprRef,
     schema: DFSchema,
 ) -> Result<(PhysicalExprRef, Operator, PhysicalExprRef)> {
-    if !is_compare_op(op) {
+    if !is_compare_op(&op) {
         return plan_err!("rewrite_expr_to_prunable only support compare expression");
     }
 
@@ -1127,7 +1131,7 @@ fn rewrite_expr_to_prunable(
     }
 }
 
-fn is_compare_op(op: Operator) -> bool {
+fn is_compare_op(op: &Operator) -> bool {
     matches!(
         op,
         Operator::Eq
@@ -1170,7 +1174,7 @@ fn rewrite_column_expr(
     column_old: &phys_expr::Column,
     column_new: &phys_expr::Column,
 ) -> Result<Arc<dyn PhysicalExpr>> {
-    e.transform(&|expr| {
+    e.transform(|expr| {
         if let Some(column) = expr.as_any().downcast_ref::<phys_expr::Column>() {
             if column == column_old {
                 return Ok(Transformed::yes(Arc::new(column_new.clone())));
@@ -1235,26 +1239,51 @@ fn build_single_column_expr(
 /// returns a pruning expression in terms of IsNull that will evaluate to true
 /// if the column may contain null, and false if definitely does not
 /// contain null.
+/// If `with_not` is true, build a pruning expression for `col IS NOT NULL`: `col_count != col_null_count`
+/// The pruning expression evaluates to true ONLY if the column definitely CONTAINS
+/// at least one NULL value.  In this case we can know that `IS NOT NULL` can not be true and
+/// thus can prune the row group / value
 fn build_is_null_column_expr(
     expr: &Arc<dyn PhysicalExpr>,
     schema: &Schema,
     required_columns: &mut RequiredColumns,
+    with_not: bool,
 ) -> Option<Arc<dyn PhysicalExpr>> {
     if let Some(col) = expr.as_any().downcast_ref::<phys_expr::Column>() {
         let field = schema.field_with_name(col.name()).ok()?;
 
         let null_count_field = &Field::new(field.name(), DataType::UInt64, true);
-        required_columns
-            .null_count_column_expr(col, expr, null_count_field)
-            .map(|null_count_column_expr| {
-                // IsNull(column) => null_count > 0
-                Arc::new(phys_expr::BinaryExpr::new(
-                    null_count_column_expr,
-                    Operator::Gt,
-                    Arc::new(phys_expr::Literal::new(ScalarValue::UInt64(Some(0)))),
-                )) as _
-            })
-            .ok()
+        if with_not {
+            if let Ok(row_count_expr) =
+                required_columns.row_count_column_expr(col, expr, null_count_field)
+            {
+                required_columns
+                    .null_count_column_expr(col, expr, null_count_field)
+                    .map(|null_count_column_expr| {
+                        // IsNotNull(column) => null_count != row_count
+                        Arc::new(phys_expr::BinaryExpr::new(
+                            null_count_column_expr,
+                            Operator::NotEq,
+                            row_count_expr,
+                        )) as _
+                    })
+                    .ok()
+            } else {
+                None
+            }
+        } else {
+            required_columns
+                .null_count_column_expr(col, expr, null_count_field)
+                .map(|null_count_column_expr| {
+                    // IsNull(column) => null_count > 0
+                    Arc::new(phys_expr::BinaryExpr::new(
+                        null_count_column_expr,
+                        Operator::Gt,
+                        Arc::new(phys_expr::Literal::new(ScalarValue::UInt64(Some(0)))),
+                    )) as _
+                })
+                .ok()
+        }
     } else {
         None
     }
@@ -1283,8 +1312,17 @@ fn build_predicate_expression(
     // predicate expression can only be a binary expression
     let expr_any = expr.as_any();
     if let Some(is_null) = expr_any.downcast_ref::<phys_expr::IsNullExpr>() {
-        return build_is_null_column_expr(is_null.arg(), schema, required_columns)
+        return build_is_null_column_expr(is_null.arg(), schema, required_columns, false)
             .unwrap_or(unhandled);
+    }
+    if let Some(is_not_null) = expr_any.downcast_ref::<phys_expr::IsNotNullExpr>() {
+        return build_is_null_column_expr(
+            is_not_null.arg(),
+            schema,
+            required_columns,
+            true,
+        )
+        .unwrap_or(unhandled);
     }
     if let Some(col) = expr_any.downcast_ref::<phys_expr::Column>() {
         return build_single_column_expr(col, schema, required_columns, false)
@@ -1320,11 +1358,13 @@ fn build_predicate_expression(
                 .map(|e| {
                     Arc::new(phys_expr::BinaryExpr::new(
                         in_list.expr().clone(),
-                        eq_op,
+                        eq_op.clone(),
                         e.clone(),
                     )) as _
                 })
-                .reduce(|a, b| Arc::new(phys_expr::BinaryExpr::new(a, re_op, b)) as _)
+                .reduce(|a, b| {
+                    Arc::new(phys_expr::BinaryExpr::new(a, re_op.clone(), b)) as _
+                })
                 .unwrap();
             return build_predicate_expression(&change_expr, schema, required_columns);
         } else {
@@ -1336,7 +1376,7 @@ fn build_predicate_expression(
         if let Some(bin_expr) = expr_any.downcast_ref::<phys_expr::BinaryExpr>() {
             (
                 bin_expr.left().clone(),
-                *bin_expr.op(),
+                bin_expr.op().clone(),
                 bin_expr.right().clone(),
             )
         } else {
@@ -1348,7 +1388,7 @@ fn build_predicate_expression(
         let left_expr = build_predicate_expression(&left, schema, required_columns);
         let right_expr = build_predicate_expression(&right, schema, required_columns);
         // simplify boolean expression if applicable
-        let expr = match (&left_expr, op, &right_expr) {
+        let expr = match (&left_expr, &op, &right_expr) {
             (left, Operator::And, _) if is_always_true(left) => right_expr,
             (_, Operator::And, right) if is_always_true(right) => left_expr,
             (left, Operator::Or, right)
@@ -1356,7 +1396,11 @@ fn build_predicate_expression(
             {
                 unhandled
             }
-            _ => Arc::new(phys_expr::BinaryExpr::new(left_expr, op, right_expr)),
+            _ => Arc::new(phys_expr::BinaryExpr::new(
+                left_expr,
+                op.clone(),
+                right_expr,
+            )),
         };
         return expr;
     }
@@ -1511,21 +1555,22 @@ pub(crate) enum StatisticsType {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::ops::{Not, Rem};
+
     use super::*;
+    use crate::assert_batches_eq;
     use crate::logical_expr::{col, lit};
-    use crate::{assert_batches_eq, physical_optimizer::pruning::StatisticsType};
+
     use arrow::array::Decimal128Array;
     use arrow::{
         array::{BinaryArray, Int32Array, Int64Array, StringArray},
-        datatypes::{DataType, TimeUnit},
+        datatypes::TimeUnit,
     };
-    use datafusion_common::{ScalarValue, ToDFSchema};
-    use datafusion_expr::execution_props::ExecutionProps;
+    use arrow_array::UInt64Array;
     use datafusion_expr::expr::InList;
     use datafusion_expr::{cast, is_null, try_cast, Expr};
-    use datafusion_physical_expr::create_physical_expr;
-    use std::collections::HashMap;
-    use std::ops::{Not, Rem};
+    use datafusion_physical_expr::planner::logical2physical;
 
     #[derive(Debug, Default)]
     /// Mock statistic provider for tests
@@ -1684,10 +1729,10 @@ mod tests {
         /// there are containers
         fn with_null_counts(
             mut self,
-            counts: impl IntoIterator<Item = Option<i64>>,
+            counts: impl IntoIterator<Item = Option<u64>>,
         ) -> Self {
             let null_counts: ArrayRef =
-                Arc::new(counts.into_iter().collect::<Int64Array>());
+                Arc::new(counts.into_iter().collect::<UInt64Array>());
 
             self.assert_invariants();
             self.null_counts = Some(null_counts);
@@ -1698,10 +1743,10 @@ mod tests {
         /// there are containers
         fn with_row_counts(
             mut self,
-            counts: impl IntoIterator<Item = Option<i64>>,
+            counts: impl IntoIterator<Item = Option<u64>>,
         ) -> Self {
             let row_counts: ArrayRef =
-                Arc::new(counts.into_iter().collect::<Int64Array>());
+                Arc::new(counts.into_iter().collect::<UInt64Array>());
 
             self.assert_invariants();
             self.row_counts = Some(row_counts);
@@ -1753,13 +1798,13 @@ mod tests {
             self
         }
 
-        /// Add null counts for the specified columm.
+        /// Add null counts for the specified column.
         /// There must be the same number of null counts as
         /// there are containers
         fn with_null_counts(
             mut self,
             name: impl Into<String>,
-            counts: impl IntoIterator<Item = Option<i64>>,
+            counts: impl IntoIterator<Item = Option<u64>>,
         ) -> Self {
             let col = Column::from_name(name.into());
 
@@ -1775,13 +1820,13 @@ mod tests {
             self
         }
 
-        /// Add row counts for the specified columm.
+        /// Add row counts for the specified column.
         /// There must be the same number of row counts as
         /// there are containers
         fn with_row_counts(
             mut self,
             name: impl Into<String>,
-            counts: impl IntoIterator<Item = Option<i64>>,
+            counts: impl IntoIterator<Item = Option<u64>>,
         ) -> Self {
             let col = Column::from_name(name.into());
 
@@ -1797,7 +1842,7 @@ mod tests {
             self
         }
 
-        /// Add contained information for the specified columm.
+        /// Add contained information for the specified column.
         fn with_contained(
             mut self,
             name: impl Into<String>,
@@ -3830,11 +3875,5 @@ mod tests {
     ) -> Arc<dyn PhysicalExpr> {
         let expr = logical2physical(expr, schema);
         build_predicate_expression(&expr, schema, required_columns)
-    }
-
-    fn logical2physical(expr: &Expr, schema: &Schema) -> Arc<dyn PhysicalExpr> {
-        let df_schema = schema.clone().to_dfschema().unwrap();
-        let execution_props = ExecutionProps::new();
-        create_physical_expr(expr, &df_schema, &execution_props).unwrap()
     }
 }

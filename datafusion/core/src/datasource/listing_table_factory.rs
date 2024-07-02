@@ -18,14 +18,8 @@
 //! Factory for creating ListingTables with default options
 
 use std::path::Path;
-use std::str::FromStr;
 use std::sync::Arc;
 
-#[cfg(feature = "parquet")]
-use crate::datasource::file_format::parquet::ParquetFormat;
-use crate::datasource::file_format::{
-    arrow::ArrowFormat, avro::AvroFormat, csv::CsvFormat, json::JsonFormat, FileFormat,
-};
 use crate::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
@@ -34,7 +28,8 @@ use crate::datasource::TableProvider;
 use crate::execution::context::SessionState;
 
 use arrow::datatypes::{DataType, SchemaRef};
-use datafusion_common::{arrow_datafusion_err, DataFusionError, FileType};
+use datafusion_common::{arrow_datafusion_err, DataFusionError};
+use datafusion_common::{config_datafusion_err, Result};
 use datafusion_expr::CreateExternalTable;
 
 use async_trait::async_trait;
@@ -56,34 +51,16 @@ impl TableProviderFactory for ListingTableFactory {
         &self,
         state: &SessionState,
         cmd: &CreateExternalTable,
-    ) -> datafusion_common::Result<Arc<dyn TableProvider>> {
-        let mut table_options = state.default_table_options();
-        let file_type = FileType::from_str(cmd.file_type.as_str()).map_err(|_| {
-            DataFusionError::Execution(format!("Unknown FileType {}", cmd.file_type))
-        })?;
-        table_options.set_file_format(file_type.clone());
-        table_options.alter_with_string_hash_map(&cmd.options)?;
+    ) -> Result<Arc<dyn TableProvider>> {
+        let file_format = state
+            .get_file_format_factory(cmd.file_type.as_str())
+            .ok_or(config_datafusion_err!(
+                "Unable to create table with format {}! Could not find FileFormat.",
+                cmd.file_type
+            ))?
+            .create(state, &cmd.options)?;
+
         let file_extension = get_extension(cmd.location.as_str());
-        let file_format: Arc<dyn FileFormat> = match file_type {
-            FileType::CSV => {
-                let mut csv_options = table_options.csv;
-                csv_options.has_header = cmd.has_header;
-                csv_options.delimiter = cmd.delimiter as u8;
-                csv_options.compression = cmd.file_compression_type;
-                Arc::new(CsvFormat::default().with_options(csv_options))
-            }
-            #[cfg(feature = "parquet")]
-            FileType::PARQUET => {
-                Arc::new(ParquetFormat::default().with_options(table_options.parquet))
-            }
-            FileType::AVRO => Arc::new(AvroFormat),
-            FileType::JSON => {
-                let mut json_options = table_options.json;
-                json_options.compression = cmd.file_compression_type;
-                Arc::new(JsonFormat::default().with_options(json_options))
-            }
-            FileType::ARROW => Arc::new(ArrowFormat),
-        };
 
         let (provided_schema, table_partition_cols) = if cmd.schema.fields().is_empty() {
             (
@@ -137,6 +114,8 @@ impl TableProviderFactory for ListingTableFactory {
             .with_table_partition_cols(table_partition_cols)
             .with_file_sort_order(cmd.order_exprs.clone());
 
+        options.validate_partitions(state, &table_path).await?;
+
         let resolved_schema = match provided_schema {
             None => options.infer_schema(state, &table_path).await?,
             Some(s) => s,
@@ -168,10 +147,11 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::execution::context::SessionContext;
+    use crate::{
+        datasource::file_format::csv::CsvFormat, execution::context::SessionContext,
+    };
 
-    use datafusion_common::parsers::CompressionTypeVariant;
-    use datafusion_common::{Constraints, DFSchema, OwnedTableReference};
+    use datafusion_common::{Constraints, DFSchema, TableReference};
 
     #[tokio::test]
     async fn test_create_using_non_std_file_ext() {
@@ -184,21 +164,18 @@ mod tests {
         let factory = ListingTableFactory::new();
         let context = SessionContext::new();
         let state = context.state();
-        let name = OwnedTableReference::bare("foo");
+        let name = TableReference::bare("foo");
         let cmd = CreateExternalTable {
             name,
             location: csv_file.path().to_str().unwrap().to_string(),
             file_type: "csv".to_string(),
-            has_header: true,
-            delimiter: ',',
             schema: Arc::new(DFSchema::empty()),
             table_partition_cols: vec![],
             if_not_exists: false,
-            file_compression_type: CompressionTypeVariant::UNCOMPRESSED,
             definition: None,
             order_exprs: vec![],
             unbounded: false,
-            options: HashMap::new(),
+            options: HashMap::from([("format.has_header".into(), "true".into())]),
             constraints: Constraints::empty(),
             column_defaults: HashMap::new(),
         };
@@ -222,20 +199,18 @@ mod tests {
         let factory = ListingTableFactory::new();
         let context = SessionContext::new();
         let state = context.state();
-        let name = OwnedTableReference::bare("foo");
+        let name = TableReference::bare("foo");
 
         let mut options = HashMap::new();
         options.insert("format.schema_infer_max_rec".to_owned(), "1000".to_owned());
+        options.insert("format.has_header".into(), "true".into());
         let cmd = CreateExternalTable {
             name,
             location: csv_file.path().to_str().unwrap().to_string(),
             file_type: "csv".to_string(),
-            has_header: true,
-            delimiter: ',',
             schema: Arc::new(DFSchema::empty()),
             table_partition_cols: vec![],
             if_not_exists: false,
-            file_compression_type: CompressionTypeVariant::UNCOMPRESSED,
             definition: None,
             order_exprs: vec![],
             unbounded: false,

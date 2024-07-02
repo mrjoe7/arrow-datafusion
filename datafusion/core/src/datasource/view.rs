@@ -93,13 +93,12 @@ impl TableProvider for ViewTable {
     fn get_table_definition(&self) -> Option<&str> {
         self.definition.as_deref()
     }
-
-    fn supports_filter_pushdown(
+    fn supports_filters_pushdown(
         &self,
-        _filter: &Expr,
-    ) -> Result<TableProviderFilterPushDown> {
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>> {
         // A filter is added on the View when given
-        Ok(TableProviderFilterPushDown::Exact)
+        Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
     }
 
     async fn scan(
@@ -159,7 +158,7 @@ mod tests {
 
     #[tokio::test]
     async fn issue_3242() -> Result<()> {
-        // regression test for https://github.com/apache/arrow-datafusion/pull/3242
+        // regression test for https://github.com/apache/datafusion/pull/3242
         let session_ctx = SessionContext::new_with_config(
             SessionConfig::new().with_information_schema(true),
         );

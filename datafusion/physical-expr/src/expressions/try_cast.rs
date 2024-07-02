@@ -97,8 +97,8 @@ impl PhysicalExpr for TryCastExpr {
         }
     }
 
-    fn children(&self) -> Vec<Arc<dyn PhysicalExpr>> {
-        vec![self.expr.clone()]
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        vec![&self.expr]
     }
 
     fn with_new_children(
@@ -159,7 +159,6 @@ mod tests {
         },
         datatypes::*,
     };
-    use datafusion_common::Result;
 
     // runs an end-to-end test of physical type cast
     // 1. construct a record batch with a column "a" of type A

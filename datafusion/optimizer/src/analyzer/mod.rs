@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! [`Analyzer`] and [`AnalyzerRule`]
 use std::sync::Arc;
 
 use log::debug;
@@ -26,7 +27,6 @@ use datafusion_common::{DataFusionError, Result};
 use datafusion_expr::expr::Exists;
 use datafusion_expr::expr::InSubquery;
 use datafusion_expr::expr_rewriter::FunctionRewrite;
-use datafusion_expr::utils::inspect_expr_pre;
 use datafusion_expr::{Expr, LogicalPlan};
 
 use crate::analyzer::count_wildcard_rule::CountWildcardRule;
@@ -57,7 +57,7 @@ pub mod type_coercion;
 /// Use [`SessionState::add_analyzer_rule`] to register additional
 /// `AnalyzerRule`s.
 ///
-/// [`SessionState::add_analyzer_rule`]: https://docs.rs/datafusion/latest/datafusion/execution/context/struct.SessionState.html#method.add_analyzer_rule
+/// [`SessionState::add_analyzer_rule`]: https://docs.rs/datafusion/latest/datafusion/execution/session_state/struct.SessionState.html#method.add_analyzer_rule
 pub trait AnalyzerRule {
     /// Rewrite `plan`
     fn analyze(&self, plan: LogicalPlan, config: &ConfigOptions) -> Result<LogicalPlan>;
@@ -111,11 +111,16 @@ impl Analyzer {
         self.function_rewrites.push(rewrite);
     }
 
+    /// return the list of function rewrites in this analyzer
+    pub fn function_rewrites(&self) -> &[Arc<dyn FunctionRewrite + Send + Sync>] {
+        &self.function_rewrites
+    }
+
     /// Analyze the logical plan by applying analyzer rules, and
     /// do necessary check and fail the invalid plans
     pub fn execute_and_check<F>(
         &self,
-        plan: &LogicalPlan,
+        plan: LogicalPlan,
         config: &ConfigOptions,
         mut observer: F,
     ) -> Result<LogicalPlan>
@@ -123,7 +128,7 @@ impl Analyzer {
         F: FnMut(&LogicalPlan, &dyn AnalyzerRule),
     {
         let start_time = Instant::now();
-        let mut new_plan = plan.clone();
+        let mut new_plan = plan;
 
         // Create an analyzer pass that rewrites `Expr`s to function_calls, as
         // appropriate.
@@ -155,21 +160,21 @@ impl Analyzer {
 
 /// Do necessary check and fail the invalid plan
 fn check_plan(plan: &LogicalPlan) -> Result<()> {
-    plan.apply(&mut |plan: &LogicalPlan| {
-        for expr in plan.expressions().iter() {
+    plan.apply_with_subqueries(|plan: &LogicalPlan| {
+        plan.apply_expressions(|expr| {
             // recursively look for subqueries
-            inspect_expr_pre(expr, |expr| match expr {
-                Expr::Exists(Exists { subquery, .. })
-                | Expr::InSubquery(InSubquery { subquery, .. })
-                | Expr::ScalarSubquery(subquery) => {
-                    check_subquery_expr(plan, &subquery.subquery, expr)
-                }
-                _ => Ok(()),
-            })?;
-        }
-
-        Ok(TreeNodeRecursion::Continue)
-    })?;
-
-    Ok(())
+            expr.apply(|expr| {
+                match expr {
+                    Expr::Exists(Exists { subquery, .. })
+                    | Expr::InSubquery(InSubquery { subquery, .. })
+                    | Expr::ScalarSubquery(subquery) => {
+                        check_subquery_expr(plan, &subquery.subquery, expr)?;
+                    }
+                    _ => {}
+                };
+                Ok(TreeNodeRecursion::Continue)
+            })
+        })
+    })
+    .map(|_| ())
 }

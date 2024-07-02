@@ -15,31 +15,30 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::any::Any;
+use std::sync::Arc;
+
 use arrow::compute::kernels::numeric::add;
-use arrow_array::{
-    Array, ArrayRef, Float32Array, Float64Array, Int32Array, RecordBatch, UInt8Array,
-};
-use arrow_schema::DataType::Float64;
+use arrow_array::{ArrayRef, Float32Array, Float64Array, Int32Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::execution::context::{FunctionFactory, RegisterFunction, SessionState};
 use datafusion::prelude::*;
 use datafusion::{execution::registry::FunctionRegistry, test_util};
+use datafusion_common::cast::{as_float64_array, as_int32_array};
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{
-    assert_batches_eq, assert_batches_sorted_eq, cast::as_float64_array,
-    cast::as_int32_array, not_impl_err, plan_err, ExprSchema, Result, ScalarValue,
+    assert_batches_eq, assert_batches_sorted_eq, assert_contains, exec_err, internal_err,
+    not_impl_err, plan_err, DFSchema, DataFusionError, ExprSchema, Result, ScalarValue,
 };
-use datafusion_common::{exec_err, internal_err, DataFusionError};
-use datafusion_execution::runtime_env::{RuntimeConfig, RuntimeEnv};
 use datafusion_expr::simplify::{ExprSimplifyResult, SimplifyInfo};
 use datafusion_expr::{
-    create_udaf, create_udf, Accumulator, ColumnarValue, CreateFunction, ExprSchemable,
-    LogicalPlanBuilder, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+    Accumulator, ColumnarValue, CreateFunction, CreateFunctionBody, ExprSchemable,
+    LogicalPlanBuilder, OperateFunctionArg, ScalarUDF, ScalarUDFImpl, Signature,
+    Volatility,
 };
-use rand::{thread_rng, Rng};
-use std::any::Any;
-use std::iter;
-use std::sync::Arc;
+use datafusion_functions_array::range::range_udf;
+use parking_lot::Mutex;
+use sqlparser::ast::Ident;
 
 /// test that casting happens on udfs.
 /// c11 is f32, but `custom_sqrt` requires f64. Casting happens but the logical plan and
@@ -52,7 +51,7 @@ async fn csv_query_custom_udf_with_cast() -> Result<()> {
     let actual = plan_and_collect(&ctx, sql).await.unwrap();
     let expected = [
         "+------------------------------------------+",
-        "| AVG(custom_sqrt(aggregate_test_100.c11)) |",
+        "| avg(custom_sqrt(aggregate_test_100.c11)) |",
         "+------------------------------------------+",
         "| 0.6584408483418835                       |",
         "+------------------------------------------+",
@@ -70,7 +69,7 @@ async fn csv_query_avg_sqrt() -> Result<()> {
     let actual = plan_and_collect(&ctx, sql).await.unwrap();
     let expected = [
         "+------------------------------------------+",
-        "| AVG(custom_sqrt(aggregate_test_100.c12)) |",
+        "| avg(custom_sqrt(aggregate_test_100.c12)) |",
         "+------------------------------------------+",
         "| 0.6706002946036459                       |",
         "+------------------------------------------+",
@@ -168,6 +167,86 @@ async fn scalar_udf() -> Result<()> {
     Ok(())
 }
 
+struct Simple0ArgsScalarUDF {
+    name: String,
+    signature: Signature,
+    return_type: DataType,
+}
+
+impl std::fmt::Debug for Simple0ArgsScalarUDF {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("ScalarUDF")
+            .field("name", &self.name)
+            .field("signature", &self.signature)
+            .field("fun", &"<FUNC>")
+            .finish()
+    }
+}
+
+impl ScalarUDFImpl for Simple0ArgsScalarUDF {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(self.return_type.clone())
+    }
+
+    fn invoke(&self, _args: &[ColumnarValue]) -> Result<ColumnarValue> {
+        not_impl_err!("{} function does not accept arguments", self.name())
+    }
+
+    fn invoke_no_args(&self, _number_rows: usize) -> Result<ColumnarValue> {
+        Ok(ColumnarValue::Scalar(ScalarValue::Int32(Some(100))))
+    }
+}
+
+#[tokio::test]
+async fn test_row_mismatch_error_in_scalar_udf() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(Int32Array::from(vec![1, 2]))],
+    )?;
+
+    let ctx = SessionContext::new();
+
+    ctx.register_batch("t", batch)?;
+
+    // udf that always return 1 row
+    let buggy_udf = Arc::new(|_: &[ColumnarValue]| {
+        Ok(ColumnarValue::Array(Arc::new(Int32Array::from(vec![0]))))
+    });
+
+    ctx.register_udf(create_udf(
+        "buggy_func",
+        vec![DataType::Int32],
+        Arc::new(DataType::Int32),
+        Volatility::Immutable,
+        buggy_udf,
+    ));
+    assert_contains!(
+        ctx.sql("select buggy_func(a) from t")
+            .await?
+            .show()
+            .await
+            .err()
+            .unwrap()
+            .to_string(),
+        "UDF returned a different number of rows than expected"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn scalar_udf_zero_params() -> Result<()> {
     let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
@@ -179,20 +258,14 @@ async fn scalar_udf_zero_params() -> Result<()> {
     let ctx = SessionContext::new();
 
     ctx.register_batch("t", batch)?;
-    // create function just returns 100 regardless of inp
-    let myfunc = Arc::new(|_args: &[ColumnarValue]| {
-        Ok(ColumnarValue::Array(
-            Arc::new((0..1).map(|_| 100).collect::<Int32Array>()) as ArrayRef,
-        ))
-    });
 
-    ctx.register_udf(create_udf(
-        "get_100",
-        vec![],
-        Arc::new(DataType::Int32),
-        Volatility::Immutable,
-        myfunc,
-    ));
+    let get_100_udf = Simple0ArgsScalarUDF {
+        name: "get_100".to_string(),
+        signature: Signature::exact(vec![], Volatility::Immutable),
+        return_type: DataType::Int32,
+    };
+
+    ctx.register_udf(ScalarUDF::from(get_100_udf));
 
     let result = plan_and_collect(&ctx, "select get_100() a from t").await?;
     let expected = [
@@ -308,8 +381,8 @@ async fn udaf_as_window_func() -> Result<()> {
     context.register_udaf(my_acc);
 
     let sql = "SELECT a, MY_ACC(b) OVER(PARTITION BY a) FROM my_table";
-    let expected = r#"Projection: my_table.a, AggregateUDF { inner: AggregateUDF { name: "my_acc", signature: Signature { type_signature: Exact([Int32]), volatility: Immutable }, fun: "<FUNC>" } }(my_table.b) PARTITION BY [my_table.a] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
-  WindowAggr: windowExpr=[[AggregateUDF { inner: AggregateUDF { name: "my_acc", signature: Signature { type_signature: Exact([Int32]), volatility: Immutable }, fun: "<FUNC>" } }(my_table.b) PARTITION BY [my_table.a] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]]
+    let expected = r#"Projection: my_table.a, my_acc(my_table.b) PARTITION BY [my_table.a] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+  WindowAggr: windowExpr=[[my_acc(my_table.b) PARTITION BY [my_table.a] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]]
     TableScan: my_table"#;
 
     let dataframe = context.sql(sql).await.unwrap();
@@ -399,123 +472,6 @@ async fn test_user_defined_functions_with_alias() -> Result<()> {
 
     let alias_result = plan_and_collect(&ctx, "SELECT dummy_alias(i) FROM t").await?;
     assert_batches_eq!(expected, &alias_result);
-
-    Ok(())
-}
-
-#[derive(Debug)]
-pub struct RandomUDF {
-    signature: Signature,
-}
-
-impl RandomUDF {
-    pub fn new() -> Self {
-        Self {
-            signature: Signature::any(0, Volatility::Volatile),
-        }
-    }
-}
-
-impl ScalarUDFImpl for RandomUDF {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "random_udf"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
-        Ok(Float64)
-    }
-
-    fn invoke(&self, args: &[ColumnarValue]) -> Result<ColumnarValue> {
-        let len: usize = match &args[0] {
-            // This udf is always invoked with zero argument so its argument
-            // is a null array indicating the batch size.
-            ColumnarValue::Array(array) if array.data_type().is_null() => array.len(),
-            _ => {
-                return Err(datafusion::error::DataFusionError::Internal(
-                    "Invalid argument type".to_string(),
-                ))
-            }
-        };
-        let mut rng = thread_rng();
-        let values = iter::repeat_with(|| rng.gen_range(0.1..1.0)).take(len);
-        let array = Float64Array::from_iter_values(values);
-        Ok(ColumnarValue::Array(Arc::new(array)))
-    }
-}
-
-/// Ensure that a user defined function with zero argument will be invoked
-/// with a null array indicating the batch size.
-#[tokio::test]
-async fn test_user_defined_functions_zero_argument() -> Result<()> {
-    let ctx = SessionContext::new();
-
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "index",
-        DataType::UInt8,
-        false,
-    )]));
-
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![Arc::new(UInt8Array::from_iter_values([1, 2, 3]))],
-    )?;
-
-    ctx.register_batch("data_table", batch)?;
-
-    let random_normal_udf = ScalarUDF::from(RandomUDF::new());
-    ctx.register_udf(random_normal_udf);
-
-    let result = plan_and_collect(
-        &ctx,
-        "SELECT random_udf() AS random_udf, random() AS native_random FROM data_table",
-    )
-    .await?;
-
-    assert_eq!(result.len(), 1);
-    let batch = &result[0];
-    let random_udf = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<Float64Array>()
-        .unwrap();
-    let native_random = batch
-        .column(1)
-        .as_any()
-        .downcast_ref::<Float64Array>()
-        .unwrap();
-
-    assert_eq!(random_udf.len(), native_random.len());
-
-    let mut previous = -1.0;
-    for i in 0..random_udf.len() {
-        assert!(random_udf.value(i) >= 0.0 && random_udf.value(i) < 1.0);
-        assert!(random_udf.value(i) != previous);
-        previous = random_udf.value(i);
-    }
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn deregister_udf() -> Result<()> {
-    let random_normal_udf = ScalarUDF::from(RandomUDF::new());
-    let ctx = SessionContext::new();
-
-    ctx.register_udf(random_normal_udf.clone());
-
-    assert!(ctx.udfs().contains("random_udf"));
-
-    ctx.deregister_udf("random_udf");
-
-    assert!(!ctx.udfs().contains("random_udf"));
 
     Ok(())
 }
@@ -611,6 +567,22 @@ async fn test_user_defined_functions_cast_to_i64() -> Result<()> {
         ],
         &result
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn deregister_udf() -> Result<()> {
+    let cast2i64 = ScalarUDF::from(CastToI64UDF::new());
+    let ctx = SessionContext::new();
+
+    ctx.register_udf(cast2i64.clone());
+
+    assert!(ctx.udfs().contains("cast_to_i64"));
+
+    ctx.deregister_udf("cast_to_i64");
+
+    assert!(!ctx.udfs().contains("cast_to_i64"));
 
     Ok(())
 }
@@ -808,16 +780,12 @@ impl ScalarUDFImpl for ScalarFunctionWrapper {
     fn aliases(&self) -> &[String] {
         &[]
     }
-
-    fn monotonicity(&self) -> Result<Option<datafusion_expr::FuncMonotonicity>> {
-        Ok(None)
-    }
 }
 
 impl ScalarFunctionWrapper {
     // replaces placeholders with actual arguments
     fn replacement(expr: &Expr, args: &[Expr]) -> Result<Expr> {
-        let result = expr.clone().transform(&|e| {
+        let result = expr.clone().transform(|e| {
             let r = match e {
                 Expr::Placeholder(placeholder) => {
                     let placeholder_position =
@@ -863,7 +831,7 @@ impl TryFrom<CreateFunction> for ScalarFunctionWrapper {
             name: definition.name,
             expr: definition
                 .params
-                .return_
+                .function_body
                 .expect("Expression has to be defined!"),
             return_type: definition
                 .return_type
@@ -887,15 +855,7 @@ impl TryFrom<CreateFunction> for ScalarFunctionWrapper {
 #[tokio::test]
 async fn create_scalar_function_from_sql_statement() -> Result<()> {
     let function_factory = Arc::new(CustomFunctionFactory::default());
-    let runtime_config = RuntimeConfig::new();
-    let runtime_environment = RuntimeEnv::new(runtime_config)?;
-
-    let session_config = SessionConfig::new();
-    let state =
-        SessionState::new_with_config_rt(session_config, Arc::new(runtime_environment))
-            .with_function_factory(function_factory.clone());
-
-    let ctx = SessionContext::new_with_state(state);
+    let ctx = SessionContext::new().with_function_factory(function_factory.clone());
     let options = SQLOptions::new().with_allow_ddl(false);
 
     let sql = r#"
@@ -957,6 +917,95 @@ async fn create_scalar_function_from_sql_statement() -> Result<()> {
         RETURN $1 + $3
     "#;
     assert!(ctx.sql(bad_definition_sql).await.is_err());
+
+    Ok(())
+}
+
+/// Saves whatever is passed to it as a scalar function
+#[derive(Debug, Default)]
+struct RecordingFunctonFactory {
+    calls: Mutex<Vec<CreateFunction>>,
+}
+
+impl RecordingFunctonFactory {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// return all the calls made to the factory
+    fn calls(&self) -> Vec<CreateFunction> {
+        self.calls.lock().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl FunctionFactory for RecordingFunctonFactory {
+    async fn create(
+        &self,
+        _state: &SessionState,
+        statement: CreateFunction,
+    ) -> Result<RegisterFunction> {
+        self.calls.lock().push(statement);
+
+        let udf = range_udf();
+        Ok(RegisterFunction::Scalar(udf))
+    }
+}
+
+#[tokio::test]
+async fn create_scalar_function_from_sql_statement_postgres_syntax() -> Result<()> {
+    let function_factory = Arc::new(RecordingFunctonFactory::new());
+    let ctx = SessionContext::new().with_function_factory(function_factory.clone());
+
+    let sql = r#"
+      CREATE FUNCTION strlen(name TEXT)
+      RETURNS int LANGUAGE plrust AS
+      $$
+        Ok(Some(name.unwrap().len() as i32))
+      $$;
+    "#;
+
+    let body = "
+        Ok(Some(name.unwrap().len() as i32))
+      ";
+
+    match ctx.sql(sql).await {
+        Ok(_) => {}
+        Err(e) => {
+            panic!("Error creating function: {}", e);
+        }
+    }
+
+    // verify that the call was passed through
+    let calls = function_factory.calls();
+    let schema = DFSchema::try_from(Schema::empty())?;
+    assert_eq!(calls.len(), 1);
+    let call = &calls[0];
+    let expected = CreateFunction {
+        or_replace: false,
+        temporary: false,
+        name: "strlen".into(),
+        args: Some(vec![OperateFunctionArg {
+            name: Some(Ident {
+                value: "name".into(),
+                quote_style: None,
+            }),
+            data_type: DataType::Utf8,
+            default_expr: None,
+        }]),
+        return_type: Some(DataType::Int32),
+        params: CreateFunctionBody {
+            language: Some(Ident {
+                value: "plrust".into(),
+                quote_style: None,
+            }),
+            behavior: None,
+            function_body: Some(lit(body)),
+        },
+        schema: Arc::new(schema),
+    };
+
+    assert_eq!(call, &expected);
 
     Ok(())
 }

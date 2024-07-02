@@ -17,8 +17,9 @@
 
 pub mod aggregate;
 pub mod analysis;
-pub mod binary_map;
-pub mod conditional_expressions;
+pub mod binary_map {
+    pub use datafusion_physical_expr_common::binary_map::{ArrowBytesSet, OutputType};
+}
 pub mod equivalence;
 pub mod expressions;
 pub mod functions;
@@ -28,11 +29,9 @@ mod partitioning;
 mod physical_expr;
 pub mod planner;
 mod scalar_function;
-mod sort_expr;
-pub mod sort_properties;
-pub mod string_expressions;
-pub mod tree_node;
-pub mod udf;
+pub mod udf {
+    pub use crate::scalar_function::create_physical_expr;
+}
 pub mod utils;
 pub mod window;
 
@@ -43,20 +42,30 @@ pub mod execution_props {
 }
 
 pub use aggregate::groups_accumulator::{GroupsAccumulatorAdapter, NullState};
-pub use aggregate::AggregateExpr;
 pub use analysis::{analyze, AnalysisContext, ExprBoundaries};
+pub use datafusion_physical_expr_common::aggregate::{
+    AggregateExpr, AggregatePhysicalExpressions,
+};
 pub use equivalence::EquivalenceProperties;
 pub use partitioning::{Distribution, Partitioning};
 pub use physical_expr::{
     physical_exprs_bag_equal, physical_exprs_contains, physical_exprs_equal,
-    PhysicalExpr, PhysicalExprRef,
+    PhysicalExprRef,
 };
-pub use planner::{create_physical_expr, create_physical_exprs};
-pub use scalar_function::ScalarFunctionExpr;
-pub use sort_expr::{
+
+pub use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
+pub use datafusion_physical_expr_common::sort_expr::{
     LexOrdering, LexOrderingRef, LexRequirement, LexRequirementRef, PhysicalSortExpr,
     PhysicalSortRequirement,
 };
-pub use utils::{reverse_order_bys, split_conjunction};
 
-pub use aggregate::first_last::create_first_value_accumulator;
+pub use planner::{create_physical_expr, create_physical_exprs};
+pub use scalar_function::ScalarFunctionExpr;
+
+pub use datafusion_physical_expr_common::utils::reverse_order_bys;
+pub use utils::split_conjunction;
+
+// For backwards compatibility
+pub mod tree_node {
+    pub use datafusion_physical_expr_common::tree_node::ExprContext;
+}

@@ -35,6 +35,10 @@ pub use properties::{join_equivalence_properties, EquivalenceProperties};
 /// This function constructs a duplicate-free `LexOrderingReq` by filtering out
 /// duplicate entries that have same physical expression inside. For example,
 /// `vec![a Some(ASC), a Some(DESC)]` collapses to `vec![a Some(ASC)]`.
+///
+/// It will also filter out entries that are ordered if the next entry is;
+/// for instance, `vec![floor(a) Some(ASC), a Some(ASC)]` will be collapsed to
+/// `vec![a Some(ASC)]`.
 pub fn collapse_lex_req(input: LexRequirement) -> LexRequirement {
     let mut output = Vec::<PhysicalSortRequirement>::new();
     for item in input {
@@ -51,7 +55,7 @@ pub fn add_offset_to_expr(
     expr: Arc<dyn PhysicalExpr>,
     offset: usize,
 ) -> Arc<dyn PhysicalExpr> {
-    expr.transform_down(&|e| match e.as_any().downcast_ref::<Column>() {
+    expr.transform_down(|e| match e.as_any().downcast_ref::<Column>() {
         Some(col) => Ok(Transformed::yes(Arc::new(Column::new(
             col.name(),
             offset + col.index(),
@@ -66,10 +70,8 @@ pub fn add_offset_to_expr(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
-    use crate::expressions::{col, Column};
+    use crate::expressions::col;
     use crate::PhysicalSortExpr;
 
     use arrow::compute::{lexsort_to_indices, SortColumn};
@@ -144,7 +146,7 @@ mod tests {
         let col_f = &col("f", &test_schema)?;
         let col_g = &col("g", &test_schema)?;
         let mut eq_properties = EquivalenceProperties::new(test_schema.clone());
-        eq_properties.add_equal_conditions(col_a, col_c);
+        eq_properties.add_equal_conditions(col_a, col_c)?;
 
         let option_asc = SortOptions {
             descending: false,
@@ -201,7 +203,7 @@ mod tests {
 
         let mut eq_properties = EquivalenceProperties::new(test_schema.clone());
         // Define a and f are aliases
-        eq_properties.add_equal_conditions(col_a, col_f);
+        eq_properties.add_equal_conditions(col_a, col_f)?;
         // Column e has constant value.
         eq_properties = eq_properties.add_constants([col_e.clone()]);
 
@@ -335,11 +337,11 @@ mod tests {
         let col_y_expr = Arc::new(Column::new("y", 4)) as Arc<dyn PhysicalExpr>;
 
         // a and b are aliases
-        eq_properties.add_equal_conditions(&col_a_expr, &col_b_expr);
+        eq_properties.add_equal_conditions(&col_a_expr, &col_b_expr)?;
         assert_eq!(eq_properties.eq_group().len(), 1);
 
         // This new entry is redundant, size shouldn't increase
-        eq_properties.add_equal_conditions(&col_b_expr, &col_a_expr);
+        eq_properties.add_equal_conditions(&col_b_expr, &col_a_expr)?;
         assert_eq!(eq_properties.eq_group().len(), 1);
         let eq_groups = &eq_properties.eq_group().classes[0];
         assert_eq!(eq_groups.len(), 2);
@@ -348,7 +350,7 @@ mod tests {
 
         // b and c are aliases. Exising equivalence class should expand,
         // however there shouldn't be any new equivalence class
-        eq_properties.add_equal_conditions(&col_b_expr, &col_c_expr);
+        eq_properties.add_equal_conditions(&col_b_expr, &col_c_expr)?;
         assert_eq!(eq_properties.eq_group().len(), 1);
         let eq_groups = &eq_properties.eq_group().classes[0];
         assert_eq!(eq_groups.len(), 3);
@@ -357,12 +359,12 @@ mod tests {
         assert!(eq_groups.contains(&col_c_expr));
 
         // This is a new set of equality. Hence equivalent class count should be 2.
-        eq_properties.add_equal_conditions(&col_x_expr, &col_y_expr);
+        eq_properties.add_equal_conditions(&col_x_expr, &col_y_expr)?;
         assert_eq!(eq_properties.eq_group().len(), 2);
 
         // This equality bridges distinct equality sets.
         // Hence equivalent class count should decrease from 2 to 1.
-        eq_properties.add_equal_conditions(&col_x_expr, &col_a_expr);
+        eq_properties.add_equal_conditions(&col_x_expr, &col_a_expr)?;
         assert_eq!(eq_properties.eq_group().len(), 1);
         let eq_groups = &eq_properties.eq_group().classes[0];
         assert_eq!(eq_groups.len(), 5);

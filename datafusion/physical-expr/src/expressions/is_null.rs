@@ -83,8 +83,8 @@ impl PhysicalExpr for IsNullExpr {
         }
     }
 
-    fn children(&self) -> Vec<Arc<dyn PhysicalExpr>> {
-        vec![self.arg.clone()]
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        vec![&self.arg]
     }
 
     fn with_new_children(
@@ -120,10 +120,8 @@ mod tests {
     use arrow::{
         array::{BooleanArray, StringArray},
         datatypes::*,
-        record_batch::RecordBatch,
     };
     use datafusion_common::cast::as_boolean_array;
-    use std::sync::Arc;
 
     #[test]
     fn is_null_op() -> Result<()> {

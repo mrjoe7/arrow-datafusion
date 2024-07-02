@@ -48,7 +48,7 @@ use datafusion_expr::{
     create_udaf, function::AccumulatorArgs, AggregateUDFImpl, GroupsAccumulator,
     SimpleAggregateUDF,
 };
-use datafusion_physical_expr::expressions::AvgAccumulator;
+use datafusion_functions_aggregate::average::AvgAccumulator;
 
 /// Test to show the contents of the setup
 #[tokio::test]
@@ -142,7 +142,7 @@ async fn test_udaf_as_window_with_frame_without_retract_batch() {
     let sql = "SELECT time_sum(time) OVER(ORDER BY time ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) as time_sum from t";
     // Note if this query ever does start working
     let err = execute(&ctx, sql).await.unwrap_err();
-    assert_contains!(err.to_string(), "This feature is not implemented: Aggregate can not be used as a sliding accumulator because `retract_batch` is not implemented: AggregateUDF { inner: AggregateUDF { name: \"time_sum\", signature: Signature { type_signature: Exact([Timestamp(Nanosecond, None)]), volatility: Immutable }, fun: \"<FUNC>\" } }(t.time) ORDER BY [t.time ASC NULLS LAST] ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING");
+    assert_contains!(err.to_string(), "This feature is not implemented: Aggregate can not be used as a sliding accumulator because `retract_batch` is not implemented: time_sum(t.time) ORDER BY [t.time ASC NULLS LAST] ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING");
 }
 
 /// Basic query for with a udaf returning a structure
@@ -186,7 +186,7 @@ async fn test_udaf_shadows_builtin_fn() {
     // compute with builtin `sum` aggregator
     let expected = [
         "+---------------------------------------+",
-        "| SUM(arrow_cast(t.time,Utf8(\"Int64\"))) |",
+        "| sum(arrow_cast(t.time,Utf8(\"Int64\"))) |",
         "+---------------------------------------+",
         "| 19000                                 |",
         "+---------------------------------------+",
@@ -526,7 +526,6 @@ impl Accumulator for TimeSum {
         let arr = arr.as_primitive::<TimestampNanosecondType>();
 
         for v in arr.values().iter() {
-            println!("Adding {v}");
             self.sum += v;
         }
         Ok(())
@@ -538,7 +537,6 @@ impl Accumulator for TimeSum {
     }
 
     fn evaluate(&mut self) -> Result<ScalarValue> {
-        println!("Evaluating to {}", self.sum);
         Ok(ScalarValue::TimestampNanosecond(Some(self.sum), None))
     }
 
@@ -558,7 +556,6 @@ impl Accumulator for TimeSum {
         let arr = arr.as_primitive::<TimestampNanosecondType>();
 
         for v in arr.values().iter() {
-            println!("Retracting {v}");
             self.sum -= v;
         }
         Ok(())
@@ -728,11 +725,14 @@ impl AggregateUDFImpl for TestGroupsAccumulator {
         panic!("accumulator shouldn't invoke");
     }
 
-    fn groups_accumulator_supported(&self) -> bool {
+    fn groups_accumulator_supported(&self, _args: AccumulatorArgs) -> bool {
         true
     }
 
-    fn create_groups_accumulator(&self) -> Result<Box<dyn GroupsAccumulator>> {
+    fn create_groups_accumulator(
+        &self,
+        _args: AccumulatorArgs,
+    ) -> Result<Box<dyn GroupsAccumulator>> {
         Ok(Box::new(self.clone()))
     }
 }

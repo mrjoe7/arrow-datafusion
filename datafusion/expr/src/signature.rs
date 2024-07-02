@@ -39,8 +39,7 @@ pub const FIXED_SIZE_LIST_WILDCARD: i32 = i32::MIN;
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Hash)]
 pub enum Volatility {
     /// An immutable function will always return the same output when given the same
-    /// input. An example of this is [super::BuiltinScalarFunction::Cos]. DataFusion
-    /// will attempt to inline immutable functions during planning.
+    /// input. DataFusion will attempt to inline immutable functions during planning.
     Immutable,
     /// A stable function may return different values given the same input across different
     /// queries but must return the same value for a given input within a query. An example of
@@ -52,7 +51,7 @@ pub enum Volatility {
     Stable,
     /// A volatile function may change the return value from evaluation to evaluation.
     /// Multiple invocations of a volatile function may return different results when used in the
-    /// same query. An example of this is [super::BuiltinScalarFunction::Random]. DataFusion
+    /// same query. An example of this is the random() function. DataFusion
     /// can not evaluate such functions during planning.
     /// In the query `select col1, random() from t1`, `random()` function will be evaluated
     /// for each output row, resulting in a unique random value for each row.
@@ -92,15 +91,12 @@ pub enum TypeSignature {
     /// # Examples
     /// A function such as `concat` is `Variadic(vec![DataType::Utf8, DataType::LargeUtf8])`
     Variadic(Vec<DataType>),
-    /// One or more arguments of an arbitrary but equal type.
-    /// DataFusion attempts to coerce all argument types to match the first argument's type
+    /// The acceptable signature and coercions rules to coerce arguments to this
+    /// signature are special for this function. If this signature is specified,
+    /// Datafusion will call [`ScalarUDFImpl::coerce_types`] to prepare argument types.
     ///
-    /// # Examples
-    /// Given types in signature should be coercible to the same final type.
-    /// A function such as `make_array` is `VariadicEqual`.
-    ///
-    /// `make_array(i32, i64) -> make_array(i64, i64)`
-    VariadicEqual,
+    /// [`ScalarUDFImpl::coerce_types`]: crate::udf::ScalarUDFImpl::coerce_types
+    UserDefined,
     /// One or more arguments with arbitrary types
     VariadicAny,
     /// Fixed number of arguments of an arbitrary but equal type out of a list of valid types.
@@ -123,6 +119,9 @@ pub enum TypeSignature {
     OneOf(Vec<TypeSignature>),
     /// Specifies Signatures for array functions
     ArraySignature(ArrayFunctionSignature),
+    /// Fixed number of arguments of numeric types.
+    /// See <https://docs.rs/arrow/latest/arrow/datatypes/enum.DataType.html#method.is_numeric> to know which type is considered numeric
+    Numeric(usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -182,6 +181,9 @@ impl TypeSignature {
                     .collect::<Vec<String>>()
                     .join(", ")]
             }
+            TypeSignature::Numeric(num) => {
+                vec![format!("Numeric({})", num)]
+            }
             TypeSignature::Exact(types) => {
                 vec![Self::join_types(types, ", ")]
             }
@@ -191,8 +193,8 @@ impl TypeSignature {
                     .collect::<Vec<&str>>()
                     .join(", ")]
             }
-            TypeSignature::VariadicEqual => {
-                vec!["CoercibleT, .., CoercibleT".to_string()]
+            TypeSignature::UserDefined => {
+                vec!["UserDefined".to_string()]
             }
             TypeSignature::VariadicAny => vec!["Any, .., Any".to_string()],
             TypeSignature::OneOf(sigs) => {
@@ -256,13 +258,21 @@ impl Signature {
             volatility,
         }
     }
-    /// An arbitrary number of arguments of the same type.
-    pub fn variadic_equal(volatility: Volatility) -> Self {
+    /// User-defined coercion rules for the function.
+    pub fn user_defined(volatility: Volatility) -> Self {
         Self {
-            type_signature: TypeSignature::VariadicEqual,
+            type_signature: TypeSignature::UserDefined,
             volatility,
         }
     }
+
+    pub fn numeric(num: usize, volatility: Volatility) -> Self {
+        Self {
+            type_signature: TypeSignature::Numeric(num),
+            volatility,
+        }
+    }
+
     /// An arbitrary number of arguments of any type.
     pub fn variadic_any(volatility: Volatility) -> Self {
         Self {
@@ -346,14 +356,6 @@ impl Signature {
         }
     }
 }
-
-/// Monotonicity of the `ScalarFunctionExpr` with respect to its arguments.
-/// Each element of this vector corresponds to an argument and indicates whether
-/// the function's behavior is monotonic, or non-monotonic/unknown for that argument, namely:
-/// - `None` signifies unknown monotonicity or non-monotonicity.
-/// - `Some(true)` indicates that the function is monotonically increasing w.r.t. the argument in question.
-/// - Some(false) indicates that the function is monotonically decreasing w.r.t. the argument in question.
-pub type FuncMonotonicity = Vec<Option<bool>>;
 
 #[cfg(test)]
 mod tests {

@@ -24,7 +24,8 @@ use arrow::array::*;
 use arrow::datatypes::*;
 use arrow::row::Rows;
 use arrow::{downcast_dictionary_array, downcast_primitive_array};
-use arrow_buffer::i256;
+use arrow_buffer::IntervalDayTime;
+use arrow_buffer::IntervalMonthDayNano;
 
 use crate::cast::{
     as_boolean_array, as_fixed_size_list_array, as_generic_binary_array,
@@ -35,7 +36,7 @@ use crate::error::{Result, _internal_err};
 
 // Combines two hashes into one hash
 #[inline]
-fn combine_hashes(l: u64, r: u64) -> u64 {
+pub fn combine_hashes(l: u64, r: u64) -> u64 {
     let hash = (17 * 37u64).wrapping_add(l);
     hash.wrapping_mul(37).wrapping_add(r)
 }
@@ -73,7 +74,7 @@ macro_rules! hash_value {
     };
 }
 hash_value!(i8, i16, i32, i64, i128, i256, u8, u16, u32, u64);
-hash_value!(bool, str, [u8]);
+hash_value!(bool, str, [u8], IntervalDayTime, IntervalMonthDayNano);
 
 macro_rules! hash_float_value {
     ($(($t:ty, $i:ty)),+) => {
@@ -450,7 +451,6 @@ pub fn create_row_hashes_v2<'a>(
 #[cfg(test)]
 mod tests {
     use arrow::{array::*, datatypes::*};
-    use std::sync::Arc;
 
     use super::*;
 

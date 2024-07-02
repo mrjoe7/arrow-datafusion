@@ -24,7 +24,7 @@ use std::str::FromStr;
 
 use crate::error::_config_err;
 use crate::parsers::CompressionTypeVariant;
-use crate::{DataFusionError, FileType, Result};
+use crate::{DataFusionError, Result};
 
 /// A macro that wraps a configuration struct and automatically derives
 /// [`Default`] and [`ConfigField`] for it, allowing it to be used
@@ -130,9 +130,9 @@ macro_rules! config_namespace {
                     $(
                        stringify!($field_name) => self.$field_name.set(rem, value),
                     )*
-                    _ => return Err(DataFusionError::Configuration(format!(
+                    _ => return _config_err!(
                         "Config value \"{}\" not found on {}", key, stringify!($struct_name)
-                    )))
+                    )
                 }
             }
 
@@ -181,7 +181,8 @@ config_namespace! {
         /// Type of `TableProvider` to use when loading `default` schema
         pub format: Option<String>, default = None
 
-        /// If the file has a header
+        /// Default value for `format.has_header` for `CREATE EXTERNAL TABLE`
+        /// if not specified explicitly in the statement.
         pub has_header: bool, default = false
     }
 }
@@ -203,6 +204,11 @@ config_namespace! {
         /// MySQL, PostgreSQL, Hive, SQLite, Snowflake, Redshift, MsSQL, ClickHouse, BigQuery, and Ansi.
         pub dialect: String, default = "generic".to_string()
 
+        /// If true, permit lengths for `VARCHAR` such as `VARCHAR(20)`, but
+        /// ignore the length. If false, error if a `VARCHAR` with a length is
+        /// specified. The Arrow type system does not have a notion of maximum
+        /// string length and thus DataFusion can not enforce such limits.
+        pub support_varchar_with_length: bool, default = true
     }
 }
 
@@ -297,6 +303,14 @@ config_namespace! {
 
         /// Should DataFusion support recursive CTEs
         pub enable_recursive_ctes: bool, default = true
+
+        /// Attempt to eliminate sorts by packing & sorting files with non-overlapping
+        /// statistics into the same file groups.
+        /// Currently experimental
+        pub split_file_groups_by_statistics: bool, default = false
+
+        /// Should Datafusion keep the columns used for partition_by in the output RecordBatches
+        pub keep_partition_by_columns: bool, default = false
     }
 }
 
@@ -395,8 +409,11 @@ config_namespace! {
         /// default parquet writer setting
         pub encoding: Option<String>, default = None
 
-        /// Sets if bloom filter is enabled for any column
-        pub bloom_filter_enabled: bool, default = false
+        /// Use any available bloom filters when reading parquet files
+        pub bloom_filter_on_read: bool, default = true
+
+        /// Write bloom filters for all columns when creating parquet files
+        pub bloom_filter_on_write: bool, default = false
 
         /// Sets bloom filter false positive probability. If NULL, uses
         /// default parquet writer setting
@@ -571,6 +588,9 @@ config_namespace! {
         /// when an exact selectivity cannot be determined. Valid values are
         /// between 0 (no selectivity) and 100 (all rows are selected).
         pub default_filter_selectivity: u8, default = 20
+
+        /// When set to true, the optimizer will not attempt to convert Union to Interleave
+        pub prefer_existing_union: bool, default = false
     }
 }
 
@@ -593,6 +613,9 @@ config_namespace! {
 
         /// When set to true, the explain statement will print the partition sizes
         pub show_sizes: bool, default = true
+
+        /// When set to true, the explain statement will print schema information
+        pub show_schema: bool, default = false
     }
 }
 
@@ -664,22 +687,17 @@ impl ConfigOptions {
 
     /// Set a configuration option
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
-        let (prefix, key) = key.split_once('.').ok_or_else(|| {
-            DataFusionError::Configuration(format!(
-                "could not find config namespace for key \"{key}\"",
-            ))
-        })?;
+        let Some((prefix, key)) = key.split_once('.') else {
+            return _config_err!("could not find config namespace for key \"{key}\"");
+        };
 
         if prefix == "datafusion" {
             return ConfigField::set(self, key, value);
         }
 
-        let e = self.extensions.0.get_mut(prefix);
-        let e = e.ok_or_else(|| {
-            DataFusionError::Configuration(format!(
-                "Could not find config namespace \"{prefix}\""
-            ))
-        })?;
+        let Some(e) = self.extensions.0.get_mut(prefix) else {
+            return _config_err!("Could not find config namespace \"{prefix}\"");
+        };
         e.0.set(key, value)
     }
 
@@ -1109,6 +1127,16 @@ macro_rules! extensions_options {
     }
 }
 
+/// These file types have special built in behavior for configuration.
+/// Use TableOptions::Extensions for configuring other file types.
+#[derive(Debug, Clone)]
+pub enum ConfigFileType {
+    CSV,
+    #[cfg(feature = "parquet")]
+    PARQUET,
+    JSON,
+}
+
 /// Represents the configuration options available for handling different table formats within a data processing application.
 /// This struct encompasses options for various file formats including CSV, Parquet, and JSON, allowing for flexible configuration
 /// of parsing and writing behaviors specific to each format. Additionally, it supports extending functionality through custom extensions.
@@ -1127,7 +1155,7 @@ pub struct TableOptions {
 
     /// The current file format that the table operations should assume. This option allows
     /// for dynamic switching between the supported file types (e.g., CSV, Parquet, JSON).
-    pub current_format: Option<FileType>,
+    pub current_format: Option<ConfigFileType>,
 
     /// Optional extensions that can be used to extend or customize the behavior of the table
     /// options. Extensions can be registered using `Extensions::insert` and might include
@@ -1145,10 +1173,9 @@ impl ConfigField for TableOptions {
         if let Some(file_type) = &self.current_format {
             match file_type {
                 #[cfg(feature = "parquet")]
-                FileType::PARQUET => self.parquet.visit(v, "format", ""),
-                FileType::CSV => self.csv.visit(v, "format", ""),
-                FileType::JSON => self.json.visit(v, "format", ""),
-                _ => {}
+                ConfigFileType::PARQUET => self.parquet.visit(v, "format", ""),
+                ConfigFileType::CSV => self.csv.visit(v, "format", ""),
+                ConfigFileType::JSON => self.json.visit(v, "format", ""),
             }
         } else {
             self.csv.visit(v, "csv", "");
@@ -1181,12 +1208,9 @@ impl ConfigField for TableOptions {
         match key {
             "format" => match format {
                 #[cfg(feature = "parquet")]
-                FileType::PARQUET => self.parquet.set(rem, value),
-                FileType::CSV => self.csv.set(rem, value),
-                FileType::JSON => self.json.set(rem, value),
-                _ => {
-                    _config_err!("Config value \"{key}\" is not supported on {}", format)
-                }
+                ConfigFileType::PARQUET => self.parquet.set(rem, value),
+                ConfigFileType::CSV => self.csv.set(rem, value),
+                ConfigFileType::JSON => self.json.set(rem, value),
             },
             _ => _config_err!("Config value \"{key}\" not found on TableOptions"),
         }
@@ -1201,15 +1225,6 @@ impl TableOptions {
     /// A new `TableOptions` instance with default configuration values.
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Sets the file format for the table.
-    ///
-    /// # Parameters
-    ///
-    /// * `format`: The file format to use (e.g., CSV, Parquet).
-    pub fn set_file_format(&mut self, format: FileType) {
-        self.current_format = Some(format);
     }
 
     /// Creates a new `TableOptions` instance initialized with settings from a given session config.
@@ -1242,6 +1257,15 @@ impl TableOptions {
         clone
     }
 
+    /// Sets the file format for the table.
+    ///
+    /// # Parameters
+    ///
+    /// * `format`: The file format to use (e.g., CSV, Parquet).
+    pub fn set_config_format(&mut self, format: ConfigFileType) {
+        self.current_format = Some(format);
+    }
+
     /// Sets the extensions for this `TableOptions` instance.
     ///
     /// # Parameters
@@ -1267,22 +1291,21 @@ impl TableOptions {
     ///
     /// A result indicating success or failure in setting the configuration option.
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
-        let (prefix, _) = key.split_once('.').ok_or_else(|| {
-            DataFusionError::Configuration(format!(
-                "could not find config namespace for key \"{key}\""
-            ))
-        })?;
+        let Some((prefix, _)) = key.split_once('.') else {
+            return _config_err!("could not find config namespace for key \"{key}\"");
+        };
 
         if prefix == "format" {
             return ConfigField::set(self, key, value);
         }
 
-        let e = self.extensions.0.get_mut(prefix);
-        let e = e.ok_or_else(|| {
-            DataFusionError::Configuration(format!(
-                "Could not find config namespace \"{prefix}\""
-            ))
-        })?;
+        if prefix == "execution" {
+            return Ok(());
+        }
+
+        let Some(e) = self.extensions.0.get_mut(prefix) else {
+            return _config_err!("Could not find config namespace \"{prefix}\"");
+        };
         e.0.set(key, value)
     }
 
@@ -1364,12 +1387,38 @@ impl TableOptions {
 
 /// Options that control how Parquet files are read, including global options
 /// that apply to all columns and optional column-specific overrides
+///
+/// Closely tied to [`ParquetWriterOptions`](crate::file_options::parquet_writer::ParquetWriterOptions).
+/// Properties not included in [`TableParquetOptions`] may not be configurable at the external API
+/// (e.g. sorting_columns).
 #[derive(Clone, Default, Debug, PartialEq)]
 pub struct TableParquetOptions {
     /// Global Parquet options that propagates to all columns.
     pub global: ParquetOptions,
     /// Column specific options. Default usage is parquet.XX::column.
     pub column_specific_options: HashMap<String, ColumnOptions>,
+    /// Additional file-level metadata to include. Inserted into the key_value_metadata
+    /// for the written [`FileMetaData`](https://docs.rs/parquet/latest/parquet/file/metadata/struct.FileMetaData.html).
+    ///
+    /// Multiple entries are permitted
+    /// ```sql
+    /// OPTIONS (
+    ///    'format.metadata::key1' '',
+    ///    'format.metadata::key2' 'value',
+    ///    'format.metadata::key3' 'value has spaces',
+    ///    'format.metadata::key4' 'value has special chars :: :',
+    ///    'format.metadata::key_dupe' 'original will be overwritten',
+    ///    'format.metadata::key_dupe' 'final'
+    /// )
+    /// ```
+    pub key_value_metadata: HashMap<String, Option<String>>,
+}
+
+impl TableParquetOptions {
+    /// Return new default TableParquetOptions
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 impl ConfigField for TableParquetOptions {
@@ -1380,8 +1429,24 @@ impl ConfigField for TableParquetOptions {
     }
 
     fn set(&mut self, key: &str, value: &str) -> Result<()> {
-        // Determine the key if it's a global or column-specific setting
-        if key.contains("::") {
+        // Determine if the key is a global, metadata, or column-specific setting
+        if key.starts_with("metadata::") {
+            let k = match key.split("::").collect::<Vec<_>>()[..] {
+                [_meta] | [_meta, ""] => {
+                    return _config_err!(
+                        "Invalid metadata key provided, missing key in metadata::<key>"
+                    )
+                }
+                [_meta, k] => k.into(),
+                _ => {
+                    return _config_err!(
+                        "Invalid metadata key provided, found too many '::' in \"{key}\""
+                    )
+                }
+            };
+            self.key_value_metadata.insert(k, Some(value.into()));
+            Ok(())
+        } else if key.contains("::") {
             self.column_specific_options.set(key, value)
         } else {
             self.global.set(key, value)
@@ -1451,10 +1516,7 @@ macro_rules! config_namespace_with_hashmap {
 
                         inner_value.set(inner_key, value)
                     }
-                    _ => Err(DataFusionError::Configuration(format!(
-                        "Unrecognized key '{}'.",
-                        key
-                    ))),
+                    _ => _config_err!("Unrecognized key '{key}'."),
                 }
             }
 
@@ -1518,18 +1580,23 @@ config_namespace_with_hashmap! {
 config_namespace! {
     /// Options controlling CSV format
     pub struct CsvOptions {
-        pub has_header: bool, default = true
+        /// Specifies whether there is a CSV header (i.e. the first line
+        /// consists of is column names). The value `None` indicates that
+        /// the configuration should be consulted.
+        pub has_header: Option<bool>, default = None
         pub delimiter: u8, default = b','
         pub quote: u8, default = b'"'
         pub escape: Option<u8>, default = None
+        pub double_quote: Option<bool>, default = None
         pub compression: CompressionTypeVariant, default = CompressionTypeVariant::UNCOMPRESSED
         pub schema_infer_max_rec: usize, default = 100
-        pub date_format: Option<String>,  default = None
-        pub datetime_format: Option<String>,  default = None
-        pub timestamp_format: Option<String>,  default = None
-        pub timestamp_tz_format: Option<String>,  default = None
-        pub time_format: Option<String>,  default = None
-        pub null_value: Option<String>,  default = None
+        pub date_format: Option<String>, default = None
+        pub datetime_format: Option<String>, default = None
+        pub timestamp_format: Option<String>, default = None
+        pub timestamp_tz_format: Option<String>, default = None
+        pub time_format: Option<String>, default = None
+        pub null_value: Option<String>, default = None
+        pub comment: Option<u8>, default = None
     }
 }
 
@@ -1554,12 +1621,14 @@ impl CsvOptions {
     /// Set true to indicate that the first line is a header.
     /// - default to true
     pub fn with_has_header(mut self, has_header: bool) -> Self {
-        self.has_header = has_header;
+        self.has_header = Some(has_header);
         self
     }
 
-    /// True if the first line is a header.
-    pub fn has_header(&self) -> bool {
+    /// Returns true if the first line is a header. If format options does not
+    /// specify whether there is a header, returns `None` (indicating that the
+    /// configuration should be consulted).
+    pub fn has_header(&self) -> Option<bool> {
         self.has_header
     }
 
@@ -1581,6 +1650,13 @@ impl CsvOptions {
     /// - default is None
     pub fn with_escape(mut self, escape: Option<u8>) -> Self {
         self.escape = escape;
+        self
+    }
+
+    /// Set true to indicate that the CSV quotes should be doubled.
+    /// - default to true
+    pub fn with_double_quote(mut self, double_quote: bool) -> Self {
+        self.double_quote = Some(double_quote);
         self
     }
 
@@ -1618,7 +1694,10 @@ config_namespace! {
     }
 }
 
+pub trait FormatOptionsExt: Display {}
+
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum FormatOptions {
     CSV(CsvOptions),
     JSON(JsonOptions),
@@ -1627,6 +1706,7 @@ pub enum FormatOptions {
     AVRO,
     ARROW,
 }
+
 impl Display for FormatOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let out = match self {
@@ -1641,28 +1721,15 @@ impl Display for FormatOptions {
     }
 }
 
-impl From<FileType> for FormatOptions {
-    fn from(value: FileType) -> Self {
-        match value {
-            FileType::ARROW => FormatOptions::ARROW,
-            FileType::AVRO => FormatOptions::AVRO,
-            #[cfg(feature = "parquet")]
-            FileType::PARQUET => FormatOptions::PARQUET(TableParquetOptions::default()),
-            FileType::CSV => FormatOptions::CSV(CsvOptions::default()),
-            FileType::JSON => FormatOptions::JSON(JsonOptions::default()),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::any::Any;
     use std::collections::HashMap;
 
     use crate::config::{
-        ConfigEntry, ConfigExtension, ExtensionOptions, Extensions, TableOptions,
+        ConfigEntry, ConfigExtension, ConfigFileType, ExtensionOptions, Extensions,
+        TableOptions,
     };
-    use crate::FileType;
 
     #[derive(Default, Debug, Clone)]
     pub struct TestExtensionConfig {
@@ -1720,7 +1787,7 @@ mod tests {
         let mut extension = Extensions::new();
         extension.insert(TestExtensionConfig::default());
         let mut table_config = TableOptions::new().with_extensions(extension);
-        table_config.set_file_format(FileType::CSV);
+        table_config.set_config_format(ConfigFileType::CSV);
         table_config.set("format.delimiter", ";").unwrap();
         assert_eq!(table_config.csv.delimiter, b';');
         table_config.set("test.bootstrap.servers", "asd").unwrap();
@@ -1737,7 +1804,7 @@ mod tests {
     #[test]
     fn csv_u8_table_options() {
         let mut table_config = TableOptions::new();
-        table_config.set_file_format(FileType::CSV);
+        table_config.set_config_format(ConfigFileType::CSV);
         table_config.set("format.delimiter", ";").unwrap();
         assert_eq!(table_config.csv.delimiter as char, ';');
         table_config.set("format.escape", "\"").unwrap();
@@ -1750,7 +1817,7 @@ mod tests {
     #[test]
     fn parquet_table_options() {
         let mut table_config = TableOptions::new();
-        table_config.set_file_format(FileType::PARQUET);
+        table_config.set_config_format(ConfigFileType::PARQUET);
         table_config
             .set("format.bloom_filter_enabled::col1", "true")
             .unwrap();
@@ -1764,7 +1831,7 @@ mod tests {
     #[test]
     fn parquet_table_options_config_entry() {
         let mut table_config = TableOptions::new();
-        table_config.set_file_format(FileType::PARQUET);
+        table_config.set_config_format(ConfigFileType::PARQUET);
         table_config
             .set("format.bloom_filter_enabled::col1", "true")
             .unwrap();
@@ -1772,5 +1839,39 @@ mod tests {
         assert!(entries
             .iter()
             .any(|item| item.key == "format.bloom_filter_enabled::col1"))
+    }
+
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn parquet_table_options_config_metadata_entry() {
+        let mut table_config = TableOptions::new();
+        table_config.set_config_format(ConfigFileType::PARQUET);
+        table_config.set("format.metadata::key1", "").unwrap();
+        table_config.set("format.metadata::key2", "value2").unwrap();
+        table_config
+            .set("format.metadata::key3", "value with spaces ")
+            .unwrap();
+        table_config
+            .set("format.metadata::key4", "value with special chars :: :")
+            .unwrap();
+
+        let parsed_metadata = table_config.parquet.key_value_metadata.clone();
+        assert_eq!(parsed_metadata.get("should not exist1"), None);
+        assert_eq!(parsed_metadata.get("key1"), Some(&Some("".into())));
+        assert_eq!(parsed_metadata.get("key2"), Some(&Some("value2".into())));
+        assert_eq!(
+            parsed_metadata.get("key3"),
+            Some(&Some("value with spaces ".into()))
+        );
+        assert_eq!(
+            parsed_metadata.get("key4"),
+            Some(&Some("value with special chars :: :".into()))
+        );
+
+        // duplicate keys are overwritten
+        table_config.set("format.metadata::key_dupe", "A").unwrap();
+        table_config.set("format.metadata::key_dupe", "B").unwrap();
+        let parsed_metadata = table_config.parquet.key_value_metadata;
+        assert_eq!(parsed_metadata.get("key_dupe"), Some(&Some("B".into())));
     }
 }
